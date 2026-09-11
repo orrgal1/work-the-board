@@ -1,8 +1,9 @@
 # work-the-board
 
-Five agent skills for running a GitHub issue board with autonomous coding sessions.
-Built for [omp](https://github.com/orrgal1/oh-my-pi) and [herdr](https://herdr.dev),
-which supply the agent runtime and the tab/worktree workspace manager.
+Five agent skills, plus the tier agent definitions they spawn, for running a GitHub
+issue board with autonomous coding sessions. Built for [omp](https://github.com/orrgal1/oh-my-pi)
+and [herdr](https://herdr.dev), which supply the agent runtime and the tab/worktree
+workspace manager.
 
 | Skill | Use |
 |---|---|
@@ -39,15 +40,28 @@ and land on its own. `mgr:manual-approve` blocks a self-merge in either mode.
 - `mgr:awaiting-approval` — PR open, work done, operator's call.
 - `mgr:manual-approve` — never self-merge.
 
+## Layout
+
+- `new-issue/`, `next-issue/`, `work-the-board/`, `plan-on-tier/`, `review-on-tier/` —
+  skills, installed into `~/.omp/agent/skills/`.
+- `agents/` — the six tier agent definitions `plan-tier1..3` and `review-tier1..3` that
+  `plan-on-tier` and `review-on-tier` spawn, installed into `~/.omp/agent/agents/`.
+
 ## Install
 
-Symlink each skill directory into your agent's skills directory:
+One block installs both halves — the skills and the tier agents:
 
 ```bash
 git clone https://github.com/orrgal1/work-the-board ~/code/work-the-board
 for s in new-issue next-issue work-the-board plan-on-tier review-on-tier; do
   ln -s ~/code/work-the-board/$s ~/.omp/agent/skills/$s
 done
+for a in plan-tier1 plan-tier2 plan-tier3 review-tier1 review-tier2 review-tier3; do
+  ln -s ~/code/work-the-board/agents/$a.md ~/.omp/agent/agents/$a.md
+done
 ```
 
-Requires `gh` (authenticated), `jq`, `git`, and `herdr` on `PATH`.
+Requires `gh` (authenticated), `jq`, `git`, and `herdr` on `PATH`. `plan-on-tier` and
+`review-on-tier` resolve tiers 1-3 from `@tier1`/`@tier2`/`@tier3` in your `modelRoles`
+(`~/.omp/agent/config.yml`); if your config doesn't define those roles, add them first —
+the tier agents will fail to resolve a model without them.

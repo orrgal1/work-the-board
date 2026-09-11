@@ -5,42 +5,25 @@ description: "Launch a dedicated plan agent on an operator-chosen tier (1-3), sa
 
 # Plan On Tier
 
-Launch one plan subagent at the requested tier, on the current session's provider, inside this session — no new tab or terminal. Keep it alive so the operator can iterate.
+Launch one `plan-tier<N>` subagent, in-session, and keep it alive so the operator can iterate.
 
 ## 1. Get the tier
 
 Use the tier (1, 2, or 3) the operator gave. If none was given, ask — never default.
 
-## 2. Resolve provider + model
+## 2. Launch the plan subagent
 
-Identify the current provider (anthropic, openai-codex, deepseek, google-antigravity) from the active model, then look up `provider/model:effort`:
+Spawn `task` with `agent: plan-tier<N>` and a stable `name` (e.g. `PlanTier<N>`) so you can
+address it again. Pass the full plan request as its `task`. The tier maps to a role ref
+(`@tier<N>`) resolved from the operator's `modelRoles`, never a hardcoded model id — the
+active model package is what picks the provider and model behind that role.
 
-|Tier|Anthropic|OpenAI|DeepSeek|Gemini|
-|---|---|---|---|---|
-|3|`anthropic/claude-fable-5-1:high`|`openai-codex/gpt-6-astra:high`|`deepseek/deepseek-v4-flash:max`|`google-antigravity/gemini-3.8-flash:high`|
-|2|`anthropic/claude-opus-5:high`|`openai-codex/gpt-5.6-sol:high`|`deepseek/deepseek-v4-flash:high`|`google-antigravity/gemini-3.8-flash:medium`|
-|1|`anthropic/claude-sonnet-5:high`|`openai-codex/gpt-5.6-luna:high`|`deepseek/deepseek-v4-flash:low`|`google-antigravity/gemini-3.8-flash:low`|
+## 3. Relay, then iterate
 
-Tier is model strength at high effort where the provider has three models; fewer models → step the effort within the levels that model actually supports. Unrecognized provider → ask the operator instead of guessing.
+Relay the subagent's plan to the operator verbatim. On feedback, send it to that SAME
+subagent by name with `hub` `op: "send"` — a parked subagent keeps its history and wakes on
+a message — never spawn a second one for the same plan.
 
-## 3. Launch the plan subagent
+## 4. Stop
 
-`task` can't pin a specific provider/model, so run a real `omp` subprocess instead of opening a tab or terminal. `--mode json` emits JSONL — redirect it to a file, or the whole stream lands in your own context:
-
-```bash
-out=$(mktemp /tmp/plan.XXXXXX.jsonl)
-omp -p --model "<provider>/<model>:<effort>" --mode json "<plan request>" > "$out"
-session_id=$(jq -r 'select(.type=="session") | .id' "$out")
-jq -r 'select(.type=="turn_end") | .message.content[] | select(.type=="text") | .text' "$out"
-```
-
-## 4. Iterate, then stop
-
-On operator feedback, resume that same session — never start a fresh one:
-
-```bash
-omp -p --model "<provider>/<model>:<effort>" --mode json -r "$session_id" "<feedback>" > "$out"
-jq -r 'select(.type=="turn_end") | .message.content[] | select(.type=="text") | .text' "$out"
-```
-
-Stop resuming once the operator says the plan is good — nothing to tear down.
+Stop resuming once the operator says the plan is good. Nothing to tear down.

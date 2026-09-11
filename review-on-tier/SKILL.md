@@ -5,42 +5,24 @@ description: "Launch a dedicated code review agent on an operator-chosen tier (1
 
 # Review On Tier
 
-Launch one review subagent at the requested tier, on the current session's provider, inside this session — no new tab or terminal. Keep it alive so the operator can iterate.
+Launch one `review-tier<N>` subagent, in-session, and keep it alive so the operator can iterate.
 
 ## 1. Get the tier
 
 Use the tier (1, 2, or 3) the operator gave. If none was given, ask — never default.
 
-## 2. Resolve provider + model
+## 2. Launch the review subagent
 
-Identify the current provider (anthropic, openai-codex, deepseek, google-antigravity) from the active model, then look up `provider/model:effort`:
+Spawn `task` with `agent: review-tier<N>` and a stable `name` (e.g. `ReviewTier<N>`) so you
+can address it again. Pass a concrete target (diff, PR number, branch, or file set) and what
+to check as its `task` — the agent itself will refuse a bare "review this". The tier maps to
+a role ref (`@tier<N>`) resolved from the operator's `modelRoles`, never a hardcoded model id
+— the active model package is what picks the provider and model behind that role.
 
-|Tier|Anthropic|OpenAI|DeepSeek|Gemini|
-|---|---|---|---|---|
-|3|`anthropic/claude-fable-5-1:high`|`openai-codex/gpt-6-astra:high`|`deepseek/deepseek-v4-flash:max`|`google-antigravity/gemini-3.8-flash:high`|
-|2|`anthropic/claude-opus-5:high`|`openai-codex/gpt-5.6-sol:high`|`deepseek/deepseek-v4-flash:high`|`google-antigravity/gemini-3.8-flash:medium`|
-|1|`anthropic/claude-sonnet-5:high`|`openai-codex/gpt-5.6-luna:high`|`deepseek/deepseek-v4-flash:low`|`google-antigravity/gemini-3.8-flash:low`|
+## 3. Relay, iterate, stop
 
-Tier is model strength at high effort where the provider has three models; fewer models → step the effort within the levels that model actually supports. Unrecognized provider → ask the operator instead of guessing.
-
-## 3. Launch the review subagent
-
-`task` can't pin a specific provider/model, so run a real `omp` subprocess instead of opening a tab or terminal. Give it a concrete target (diff, PR number, branch, or file set) and what to check (correctness, security, quality, spec adherence) — never a bare "review this". `--mode json` emits JSONL — redirect it to a file, or the whole stream lands in your own context:
-
-```bash
-out=$(mktemp /tmp/review.XXXXXX.jsonl)
-omp -p --model "<provider>/<model>:<effort>" --mode json "<review request>" > "$out"
-session_id=$(jq -r 'select(.type=="session") | .id' "$out")
-jq -r 'select(.type=="turn_end") | .message.content[] | select(.type=="text") | .text' "$out"
-```
-
-## 4. Iterate, then stop
-
-On operator feedback (challenge a finding, re-check after a fix, narrow or widen scope), resume that same session — never start a fresh one:
-
-```bash
-omp -p --model "<provider>/<model>:<effort>" --mode json -r "$session_id" "<feedback>" > "$out"
-jq -r 'select(.type=="turn_end") | .message.content[] | select(.type=="text") | .text' "$out"
-```
-
-Stop resuming once the operator says the review is done — nothing to tear down.
+Relay the subagent's findings to the operator verbatim. On feedback (challenge a finding,
+re-check after a fix, narrow scope), send it to that SAME subagent by name with `hub`
+`op: "send"` — a parked subagent keeps its history and wakes on a message — never spawn a
+second one for the same review. Stop resuming once the operator says the review is done;
+nothing to tear down.
