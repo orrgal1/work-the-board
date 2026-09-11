@@ -143,6 +143,38 @@ done
 bv() { eval "bvv=\${BOARD_$1_$2-}"; }
 bset() { eval "BOARD_$1_$2=\$3"; }
 
+# Resolves an item's repo (owner/repo) to board <i>'s local checkout path or
+# workspace through BOARD_<i>_REPOMAP ("nwo<TAB>path<TAB>workspace" lines).
+# rc 1 when the repo is not in the map — the caller decides whether that is
+# a skip (project items of unmapped repos) or a bug (a launch for a repo the
+# backend itself admitted).
+repo_path() { # <i> <nwo>
+  local m
+  bv "$1" REPOMAP
+  m=$(awk -F'\t' -v r="$2" '$1 == r { print $2; exit }' <<<"$bvv")
+  [ -n "$m" ] || return 1
+  printf '%s\n' "$m"
+}
+repo_workspace() { # <i> <nwo>
+  local m
+  bv "$1" REPOMAP
+  m=$(awk -F'\t' -v r="$2" '$1 == r { print $3; exit }' <<<"$bvv")
+  [ -n "$m" ] || return 1
+  printf '%s\n' "$m"
+}
+
+# skip_once <nwo>: rc 0 exactly once per (board, repo) — records
+# "<board>\x01<nwo>" in the current board's SKIP set and refuses the second
+# time. The unmapped-repo notice goes through this so it fires on state
+# entry only, like the other latched reports.
+skip_once() {
+  local sep set
+  sep=$'\x01'
+  bv "$CUR_IDX" SKIP; set=$bvv
+  if grep -qxF "$CUR_NAME$sep$1" <<<"$set"; then return 1; fi
+  bset "$CUR_IDX" SKIP "$(printf '%s\n%s%s%s' "$set" "$CUR_NAME" "$sep" "$1")"
+}
+
 # ---------------------------------------------------------------------------
 # Config: --config file, or the positional form synthesized into the exact
 # equivalent one-board config. Parsed and validated in ONE jq pass that
@@ -352,16 +384,25 @@ while IFS=$'\t' read -r _tag c_name c_kind c_repo c_path c_ws c_conc c_mode c_ow
   bset "$i" FLIGHT_SEEN_DEPART ""
   bset "$i" DONE_SYNCED ""
   bset "$i" FAILS 0
-  bset "$i" SKIP 0
-  # Wave-2 seam: cursor for the slow flight-age schedule. Unused in wave 1.
+  bset "$i" BACKOFF 0
+  # Latched skip-once set for unmapped-repo notices: "<board>\x01<nwo>"
+  # lines, appended when the skip is first reported (skip_once). Never
+  # cleared — the config cannot change without a restart, and a restart
+  # re-firing the notice once is acceptable.
+  bset "$i" SKIP ""
+  # Cursor for the slow flight-age scan: epoch seconds before which the
+  # scan does not run for this board. Seeded below with a per-board offset
+  # so N boards' scans do not align into one API spike.
   bset "$i" AGE_NEXT 0
-  # Wave-2 seam: the full per-board repo map, for cross-repo project boards.
-  # Wave 1 launches only from entry 0 (CUR_REPO/CUR_PATH/CUR_WS below) and
-  # skips project items belonging to any other repo.
-  bset "$i" REPOMAP "$(jq -c --argjson i "$i" \
-    '.boards[$i] | if .kind == "repo"
+  # The board's full repo map, "nwo<TAB>path<TAB>workspace" lines: every
+  # item is dispatched into ITS OWN repo's checkout and workspace through
+  # repo_path/repo_workspace. An item whose repo is not in the map is
+  # skipped (and reported once), never held and never Status-edited.
+  bset "$i" REPOMAP "$(jq -r --argjson i "$i" \
+    '.boards[$i] | (if .kind == "repo"
        then [{repo: .repo, path: .path, workspace: .workspace}]
-       else .repos end' <<<"$CONFIG_JSON")"
+       else .repos end)
+     | .[] | [.repo, .path, .workspace] | @tsv' <<<"$CONFIG_JSON")"
   NBOARDS=$((NBOARDS + 1))
 done <<<"$rows"
 
@@ -422,6 +463,32 @@ while [ "$b" -lt "$NBOARDS" ]; do
   b=$((b + 1))
 done
 
+# Stagger the boards' slow flight-age scans (each board scans only every
+# AGE_SCAN_SECONDS — the notices are hourly, so scanning every poll bought
+# nothing) across the window, so N boards do not fire their first-sight
+# GitHub reads and marker writes in the same cycle.
+AGE_SCAN_SECONDS=600
+NOW_EPOCH=$(date -u +%s)
+b=0
+while [ "$b" -lt "$NBOARDS" ]; do
+  bset "$b" AGE_NEXT $((NOW_EPOCH + b * AGE_SCAN_SECONDS / NBOARDS))
+  b=$((b + 1))
+done
+
+# One per-board summary block, shared by the startup and stop reports: ONE
+# consolidated message listing every board, not one message per board.
+BOARDS_SUMMARY=""
+b=0
+while [ "$b" -lt "$NBOARDS" ]; do
+  bv "$b" NAME; s_name=$bvv
+  bv "$b" KIND; s_kind=$bvv
+  bv "$b" MODE; s_mode=$bvv
+  bv "$b" CONC; s_conc=$bvv
+  BOARDS_SUMMARY=$(printf '%s\n[%s] kind=%s mode=%s concurrency=%s' \
+    "$BOARDS_SUMMARY" "$s_name" "$s_kind" "$s_mode" "$s_conc")
+  b=$((b + 1))
+done
+
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
 # Fetch failures land their raw stderr here so the caller can log it. One
@@ -433,13 +500,16 @@ trap 'rm -f "$ERRFILE"' EXIT
 # reading the log. Only state changes are reported — launches, failures, released
 # claims — never idle cycles, or the board session gets woken every poll for
 # nothing. Fire-and-forget: never --wait here, or a busy board session would
-# stall the whole loop.
-report() {
+# stall the whole loop. report prefixes the current board's name so N boards'
+# messages stay attributable in one operator session; report_raw carries the
+# watcher-wide consolidated messages (startup/stop) only.
+report_raw() {
   [ -n "$REPORT_TARGET" ] || return 0
   herdr agent prompt "$REPORT_TARGET" "board watcher: $1" >/dev/null 2>&1 || true
 }
+report() { report_raw "[$CUR_NAME] $1"; }
 
-trap 'log "watcher stopping"; report "stopped."; exit 0' TERM INT
+trap 'log "watcher stopping"; report_raw "stopped.$BOARDS_SUMMARY"; exit 0' TERM INT
 
 # ---------------------------------------------------------------------------
 # Board backends. The cycle body only calls board_load / board_inflight /
@@ -492,7 +562,7 @@ def blocked_refs:
   ([(.body // "") | scan("Blocked by:[^\n]*"; "i")] | join(" "))
   | [scan("[0-9]+")] | map(tonumber);
 def unblocked($open): (blocked_refs | any(. as $r | $open | index($r) != null)) | not;
-def emit_ready: sort_by(.prio, .number) | .[] | "\(.number)\t\(.title)";
+def emit_ready: sort_by(.prio, .number) | .[] | "\(.nwo)\t\(.number)\t\(.title)";
 '
 
 READY_FILTER="$READY_RULES"'
@@ -500,7 +570,7 @@ READY_FILTER="$READY_RULES"'
 | [ .[]
     | select(((label_names | (index("mgr:in-flight") or index("mgr:hold"))) or is_research) | not)
     | select(unblocked($open))
-    | { number, title, prio: prio }
+    | { nwo: $repo, number, title, prio: prio }
   ]
 | emit_ready
 '
@@ -508,29 +578,30 @@ READY_FILTER="$READY_RULES"'
 # --- repo backend: the original mgr:* label state machine -------------------
 
 repo_board_load() {
-  inflight_data=$(gh issue list -R "$CUR_REPO" --state open --label mgr:in-flight --json number,title --jq '.[] | "\(.number)\t\(.title)"' 2>"$ERRFILE") || return 1
+  inflight_data=$(gh issue list -R "$CUR_REPO" --state open --label mgr:in-flight --json number,title \
+    --jq '.[] | "'"$CUR_REPO"'\t\(.number)\t\(.title)"' 2>"$ERRFILE") || return 1
 }
 
-# Prints ready issues, one per line, as "<number><TAB><title>".
+# Prints ready issues, one per line, as "<nwo><TAB><number><TAB><title>".
 repo_board_ready() {
   local data
   data=$(gh issue list -R "$CUR_REPO" --state open --json number,title,labels,body --limit 200 2>"$ERRFILE") || return 1
   [ -z "$data" ] && return 0
-  jq -r "$READY_FILTER" <<<"$data" 2>/dev/null
+  jq -r --arg repo "$CUR_REPO" "$READY_FILTER" <<<"$data" 2>/dev/null
 }
 
-repo_board_claim() { gh issue edit "$1" -R "$CUR_REPO" --add-label mgr:in-flight >/dev/null 2>&1; }
-repo_board_release() { gh issue edit "$1" -R "$CUR_REPO" --remove-label mgr:in-flight >/dev/null 2>&1; }
+repo_board_claim() { gh issue edit "$2" -R "$1" --add-label mgr:in-flight >/dev/null 2>&1; }      # <nwo> <num>
+repo_board_release() { gh issue edit "$2" -R "$1" --remove-label mgr:in-flight >/dev/null 2>&1; } # <nwo> <num>
 
 # A closed issue still carrying mgr:in-flight is pure residue: the label no
 # longer gates anything (capacity only counts open issues) but it is exactly
 # what accumulates into a board nobody can read. Sessions sometimes close the
 # issue and exit before dropping it. No judgment needed once the issue is
 # closed, so strip it.
-repo_board_finish() {
-  if gh issue view "$1" -R "$CUR_REPO" --json labels --jq '[.labels[].name] | index("mgr:in-flight") // empty' 2>/dev/null | grep -q .; then
-    gh issue edit "$1" -R "$CUR_REPO" --remove-label mgr:in-flight >/dev/null 2>&1 \
-      && log "issue #$1: stripped stale mgr:in-flight from a closed issue"
+repo_board_finish() { # <nwo> <num>
+  if gh issue view "$2" -R "$1" --json labels --jq '[.labels[].name] | index("mgr:in-flight") // empty' 2>/dev/null | grep -q .; then
+    gh issue edit "$2" -R "$1" --remove-label mgr:in-flight >/dev/null 2>&1 \
+      && log "issue #$2: stripped stale mgr:in-flight from a closed issue"
   fi
 }
 
@@ -543,90 +614,122 @@ repo_board_finish() {
 # single-select arrives as .status (the option NAME), the board's built-in
 # Labels field as .labels (bare name strings; a board that removed that field
 # shows the label rules no labels at all). content carries NO open/closed
-# state, which is why board_load also fetches $open, this repo's open issue
-# numbers. Draft items, PRs, and issues of other repos are skipped — the
-# cross-repo dispatch through BOARD_<i>_REPOMAP is wave 2; until then a
-# project board acts on its repos[0] entry only.
+# state, which is why board_load also fetches each mapped repo's open issue
+# numbers ($openmap: nwo -> [numbers]). Draft items, PRs, and items of
+# repos outside the board's map ($repos, the mapped nwo list) are dropped
+# here; the unmapped ones are additionally reported — once per (board,
+# repo) — by project_board_load.
 PROJECT_NORMALIZE='
 [ .items[]?
-  | select((.content.type // "") == "Issue" and (.content.repository // "") == $repo)
+  | (.content.repository // "") as $r
+  | select((.content.type // "") == "Issue"
+           and (($repos | index($r)) != null))
   | .content.number as $n
-  | { number: $n,
+  | { nwo: $r,
+      number: $n,
       title: (.content.title // ""),
       item: .id,
       status: (.status // ""),
-      state: (if ($open | index($n)) != null then "OPEN" else "CLOSED" end),
+      state: (if (($openmap[$r] // []) | index($n)) != null then "OPEN" else "CLOSED" end),
       labels: (.labels // []),
       body: (.content.body // "") } ]
 '
 
 project_items="[]"
-project_open_numbers="[]"
+project_open_map="{}"
 
 project_board_load() {
-  local raw
+  local raw mapped_json r open_json
   raw=$(gh project item-list "$CUR_NUMBER" --owner "$CUR_OWNER" --format json --limit 200 2>"$ERRFILE") || return 1
-  project_open_numbers=$(gh issue list -R "$CUR_REPO" --state open --json number --limit 200 --jq '[.[].number]' 2>"$ERRFILE") || return 1
-  [ -z "$project_open_numbers" ] && project_open_numbers="[]"
-  project_items=$(jq -c --arg repo "$CUR_REPO" --argjson open "$project_open_numbers" "$PROJECT_NORMALIZE" <<<"$raw" 2>/dev/null)
+  mapped_json=$(cut -f1 <<<"$CUR_REPOMAP" | jq -R . | jq -cs .)
+
+  # Open/closed state per repo: one open-issue-number fetch per MAPPED repo
+  # that actually has issue items on the board this cycle.
+  project_open_map="{}"
+  while read -r r; do
+    [ -z "$r" ] && continue
+    open_json=$(gh issue list -R "$r" --state open --json number --limit 200 --jq '[.[].number]' 2>"$ERRFILE") || return 1
+    [ -z "$open_json" ] && open_json="[]"
+    project_open_map=$(jq -c --arg r "$r" --argjson o "$open_json" '. + {($r): $o}' <<<"$project_open_map")
+  done <<<"$(jq -r --argjson repos "$mapped_json" \
+      '[.items[]? | select((.content.type // "") == "Issue") | .content.repository // ""]
+       | unique | .[] | . as $r | select($r != "" and (($repos | index($r)) != null))' <<<"$raw" 2>/dev/null)"
+
+  project_items=$(jq -c --argjson repos "$mapped_json" --argjson openmap "$project_open_map" \
+    "$PROJECT_NORMALIZE" <<<"$raw" 2>/dev/null)
   [ -z "$project_items" ] && project_items="[]"
-  inflight_data=$(jq -r '.[] | select(.status == "In progress" and .state == "OPEN") | "\(.number)\t\(.title)"' <<<"$project_items" 2>/dev/null)
+  inflight_data=$(jq -r '.[] | select(.status == "In progress" and .state == "OPEN") | "\(.nwo)\t\(.number)\t\(.title)"' <<<"$project_items" 2>/dev/null)
+
+  # Items of repos OUTSIDE the map are SKIPPED, not held: their cards stay
+  # in Todo untouched — a Status write is a semantic statement about the
+  # work, and "the watcher is misconfigured" is not one — and the operator
+  # is told exactly once per (board, repo). Silently dropping them is this
+  # project's recurring silent-park bug; repeating the notice every poll is
+  # noise. A watcher restart re-firing it once is acceptable.
+  while read -r r; do
+    [ -z "$r" ] && continue
+    skip_once "$r" || continue
+    log "board $CUR_NAME: skipping project items of unmapped repo $r (not in this board's repos config)"
+    report "skipping this project's items in $r: that repo is not in this board's repo map. Cards left in Todo untouched; add the repo to the config and restart to dispatch them."
+  done <<<"$(jq -r --argjson repos "$mapped_json" \
+      '[.items[]? | select((.content.type // "") == "Issue") | .content.repository // ""]
+       | unique | .[] | . as $r | select($r != "" and (($repos | index($r)) == null))' <<<"$raw" 2>/dev/null)"
 
   # Reconcile residue on every load, not only on departure: a closed issue
   # whose card is still In progress (left over from before a watcher
   # restart, say) never appears in flight, so it would never be seen
   # departing and never reach Done.
-  while read -r n; do
+  while IFS=$'\t' read -r r n; do
     [ -z "$n" ] && continue
-    project_board_finish "$n"
-  done <<<"$(jq -r '.[] | select(.state == "CLOSED" and .status == "In progress") | .number' <<<"$project_items" 2>/dev/null)"
+    project_board_finish "$r" "$n"
+  done <<<"$(jq -r '.[] | select(.state == "CLOSED" and .status == "In progress") | "\(.nwo)\t\(.number)"' <<<"$project_items" 2>/dev/null)"
 }
 
 project_board_ready() {
-  jq -r --argjson open "$project_open_numbers" "$READY_RULES"'
+  jq -r --argjson openmap "$project_open_map" "$READY_RULES"'
   [ .[]
     | select(.state == "OPEN" and .status == "Todo")
     | select(is_research | not)
-    | select(unblocked($open))
-    | { number, title, prio: prio }
+    | select(unblocked($openmap[.nwo] // []))
+    | { nwo, number, title, prio: prio }
   ]
   | emit_ready' <<<"$project_items" 2>/dev/null
 }
 
-project_item_id_for() { jq -r --argjson n "$1" 'first(.[] | select(.number == $n)) | .item // empty' <<<"$project_items" 2>/dev/null; }
-project_status_for() { jq -r --argjson n "$1" 'first(.[] | select(.number == $n)) | .status // empty' <<<"$project_items" 2>/dev/null; }
+project_item_id_for() { jq -r --arg r "$1" --argjson n "$2" 'first(.[] | select(.nwo == $r and .number == $n)) | .item // empty' <<<"$project_items" 2>/dev/null; } # <nwo> <num>
+project_status_for() { jq -r --arg r "$1" --argjson n "$2" 'first(.[] | select(.nwo == $r and .number == $n)) | .status // empty' <<<"$project_items" 2>/dev/null; } # <nwo> <num>
 
 project_set_status() { # <item id> <option id>
   gh project item-edit --id "$1" --project-id "$CUR_PROJECT_ID" --field-id "$CUR_STATUS_FIELD_ID" --single-select-option-id "$2" >/dev/null 2>&1
 }
 
-project_board_claim() {
+project_board_claim() { # <nwo> <num>
   local item
-  item=$(project_item_id_for "$1")
+  item=$(project_item_id_for "$1" "$2")
   [ -n "$item" ] && project_set_status "$item" "$CUR_OPT_IN_PROGRESS"
 }
 
-project_board_release() {
+project_board_release() { # <nwo> <num>
   local item
-  item=$(project_item_id_for "$1")
+  item=$(project_item_id_for "$1" "$2")
   [ -n "$item" ] && project_set_status "$item" "$CUR_OPT_TODO"
 }
 
 # Moves a CLOSED issue's card to Done, once. PROJECT_DONE_SYNCED (persisted
-# per board as BOARD_<i>_DONE_SYNCED) remembers the numbers already moved so
-# the load-time residue sweep and the departure pass cannot double-edit the
-# same card in one cycle.
+# per board as BOARD_<i>_DONE_SYNCED) remembers the "<nwo>#<num>" keys
+# already moved so the load-time residue sweep and the departure pass cannot
+# double-edit the same card in one cycle.
 PROJECT_DONE_SYNCED=""
-project_board_finish() {
-  local num="$1" item status
-  if grep -qx "$num" <<<"$PROJECT_DONE_SYNCED"; then return 0; fi
+project_board_finish() { # <nwo> <num>
+  local nwo="$1" num="$2" item status
+  if grep -qxF "$nwo#$num" <<<"$PROJECT_DONE_SYNCED"; then return 0; fi
   [ -n "$CUR_OPT_DONE" ] || return 0
-  status=$(project_status_for "$num")
+  status=$(project_status_for "$nwo" "$num")
   case "$status" in ""|Done) return 0 ;; esac
-  item=$(project_item_id_for "$num")
+  item=$(project_item_id_for "$nwo" "$num")
   [ -n "$item" ] || return 0
   if project_set_status "$item" "$CUR_OPT_DONE"; then
-    PROJECT_DONE_SYNCED=$(printf '%s\n%s' "$PROJECT_DONE_SYNCED" "$num")
+    PROJECT_DONE_SYNCED=$(printf '%s\n%s' "$PROJECT_DONE_SYNCED" "$nwo#$num")
     log "issue #$num: closed issue's card moved to Done"
   fi
 }
@@ -646,16 +749,19 @@ board_load() {
   fi
   BOARD_FETCH_OK=1
 }
-# Both backends load inflight_data in the same "<number>\t<title>" shape
-# (title_for depends on it too), so slicing numbers out is mode-independent.
+# Both backends load inflight_data in the same "<nwo>\t<number>\t<title>"
+# shape (title_for depends on it too), so slicing the keys out is
+# mode-independent. Keys are the repo-qualified "<nwo>#<number>", not bare
+# numbers: two repos — on one cross-repo board, or across boards — can
+# reuse issue numbers.
 board_inflight() {
   [ "$BOARD_FETCH_OK" = 1 ] || return 1
-  cut -f1 <<<"$inflight_data" 2>/dev/null | sort -n
+  awk -F'\t' 'NF { print $1 "#" $2 }' <<<"$inflight_data" 2>/dev/null | sort
 }
 board_ready() { if [ "$CUR_KIND" = "project" ]; then project_board_ready; else repo_board_ready; fi; }
-board_claim() { if [ "$CUR_KIND" = "project" ]; then project_board_claim "$1"; else repo_board_claim "$1"; fi; }
-board_release() { if [ "$CUR_KIND" = "project" ]; then project_board_release "$1"; else repo_board_release "$1"; fi; }
-board_finish() { if [ "$CUR_KIND" = "project" ]; then project_board_finish "$1"; else repo_board_finish "$1"; fi; }
+board_claim() { if [ "$CUR_KIND" = "project" ]; then project_board_claim "$1" "$2"; else repo_board_claim "$1" "$2"; fi; }
+board_release() { if [ "$CUR_KIND" = "project" ]; then project_board_release "$1" "$2"; else repo_board_release "$1" "$2"; fi; }
+board_finish() { if [ "$CUR_KIND" = "project" ]; then project_board_finish "$1" "$2"; else repo_board_finish "$1" "$2"; fi; }
 
 # Converts an ISO-8601 UTC timestamp ("2026-09-10T12:00:00Z") to epoch
 # seconds. BSD date (macOS) and GNU date (Linux) take incompatible flags for
@@ -671,9 +777,9 @@ iso_to_epoch() {
 # run (or since a marker comment's own recorded start, by a prior flight
 # period). Falls back to now if the timeline has no such event or the call
 # fails. Returns an ISO-8601 UTC timestamp, GitHub's own format.
-fetch_start_iso() {
-  local num="$1" ts
-  ts=$(gh api "repos/$CUR_REPO/issues/$num/timeline" \
+fetch_start_iso() { # <nwo> <num>
+  local nwo="$1" num="$2" ts
+  ts=$(gh api "repos/$nwo/issues/$num/timeline" \
         --jq '[.[] | select(.event=="labeled" and .label.name=="mgr:in-flight") | .created_at] | last' \
         2>/dev/null)
   if [ -n "$ts" ] && [ "$ts" != "null" ]; then
@@ -694,9 +800,9 @@ FLIGHT_MARKER='<!-- work-the-board:flight -->'
 # out of the comment's HTML URL ("...#issuecomment-<id>") since `gh issue
 # view --json comments` exposes only the GraphQL node id, not the numeric
 # id the REST PATCH endpoint needs.
-age_comment_for() {
-  local num="$1" data url body cid start hours
-  data=$(gh issue view "$num" -R "$CUR_REPO" --json comments --jq \
+age_comment_for() { # <nwo> <num>
+  local nwo="$1" num="$2" data url body cid start hours
+  data=$(gh issue view "$num" -R "$nwo" --json comments --jq \
     '[.comments[] | select(.body | startswith("'"$FLIGHT_MARKER"'"))] | last
      | if . == null then empty else "\(.url)\u0001\(.body)" end' \
     2>/dev/null)
@@ -717,42 +823,44 @@ flight_comment_body() {
 }
 
 # Creates the marker comment and prints the new comment's numeric id.
-create_flight_comment() {
-  local num="$1" body="$2" url
-  url=$(gh issue comment "$num" -R "$CUR_REPO" --body "$body" 2>/dev/null)
+create_flight_comment() { # <nwo> <num> <body>
+  local nwo="$1" num="$2" body="$3" url
+  url=$(gh issue comment "$num" -R "$nwo" --body "$body" 2>/dev/null)
   printf '%s' "${url##*#issuecomment-}"
 }
 
 # Rewrites the marker comment in place. Called only on an hour boundary or a
 # clock reset, never every cycle, and never posts a second comment.
-update_flight_comment() {
-  gh api --method PATCH "repos/$CUR_REPO/issues/comments/$1" -f "body=$2" >/dev/null 2>&1
+update_flight_comment() { # <nwo> <comment id> <body>
+  gh api --method PATCH "repos/$1/issues/comments/$2" -f "body=$3" >/dev/null 2>&1
 }
 
 # GitHub is the durable record for flight-age state, but it is only READ the
 # first time this process sees an issue in flight and only WRITTEN when an
-# hour boundary fires; every other cycle is served from this in-memory
-# mirror, so steady-state cycles cost zero extra gh calls. One
-# "<num>\t<start_iso>\t<start_epoch>\t<hours_reported>\t<comment_id>" row
-# per in-flight issue, in a plain newline-delimited string: this script runs
-# on bash 3.2, which has no associative arrays. FLIGHT_SEEN_DEPART lists
-# issues that left flight while this process watched, so a re-entry is
-# distinguishable from first sight after a restart. Both are persisted per
-# board (BOARD_<i>_FLIGHT_CACHE / _FLIGHT_SEEN_DEPART) around each
-# service_board call.
+# hour boundary fires; every other scan is served from this in-memory
+# mirror. One
+# "<nwo>#<num>\t<start_iso>\t<start_epoch>\t<hours_reported>\t<comment_id>"
+# row per in-flight issue — keyed by the repo-qualified "<nwo>#<num>", since
+# a cross-repo board's repos can reuse issue numbers — in a plain
+# newline-delimited string: this script runs on bash 3.2, which has no
+# associative arrays. FLIGHT_SEEN_DEPART lists the keys that left flight
+# while this process watched, so a re-entry is distinguishable from first
+# sight after a restart. Both are persisted per board
+# (BOARD_<i>_FLIGHT_CACHE / _FLIGHT_SEEN_DEPART) around each service_board
+# call.
 FLIGHT_CACHE=""
 FLIGHT_SEEN_DEPART=""
 
 flight_cache_row() { awk -F'\t' -v n="$1" '$1 == n { print; exit }' <<<"$FLIGHT_CACHE"; }
 flight_cache_drop() { FLIGHT_CACHE=$(awk -F'\t' -v n="$1" 'NF && $1 != n' <<<"$FLIGHT_CACHE"); }
-flight_cache_put() { # <num> <start_iso> <start_epoch> <hours> <comment_id>
+flight_cache_put() { # <key> <start_iso> <start_epoch> <hours> <comment_id>
   flight_cache_drop "$1"
   FLIGHT_CACHE=$(printf '%s\n%s\t%s\t%s\t%s\t%s' "$FLIGHT_CACHE" "$1" "$2" "$3" "$4" "$5")
 }
 
 # Looks up an in-flight issue's title from this cycle's $inflight_data.
-title_for() {
-  awk -F'\t' -v n="$1" '$1==n{print $2; exit}' <<<"$inflight_data"
+title_for() { # <nwo> <num>
+  awk -F'\t' -v r="$1" -v n="$2" '$1==r && $2==n{print $3; exit}' <<<"$inflight_data"
 }
 
 # Closes tabs belonging to finished issues. This is a backstop, not the normal
@@ -768,34 +876,50 @@ title_for() {
 # A surviving worktree means the session is still finishing its own teardown,
 # and closing the tab under it would kill that mid-step.
 #
-# Wave-2 seam: tab labels are not yet board-scoped, so with several boards
-# whose repos reuse issue numbers this sweep (and the launch-time tab name
-# issue-<n>) cannot tell the boards' tabs apart; the closed-state and
-# worktree checks below at least run against THIS board's repo and path.
-# Board-scoped tab/agent naming lands in wave 2 and closes that hole.
+# Labels are board-scoped — "<board>/issue-<n>: <title>" — and each board
+# sweeps only its own tabs, checking the closed state and the worktree
+# against ITS OWN mapped repos and paths. The label carries the board and
+# number but not the repo, so a cross-repo board checks every mapped repo:
+# the tab closes only when no mapped repo has the issue OPEN, at least one
+# has it CLOSED, and no mapped checkout still holds an issue-<n> worktree.
+#
+# NOTE: tabs created before this naming change (bare "issue-<n>: <title>")
+# no longer match the pattern and are never swept; close leftovers from a
+# pre-upgrade watcher once by hand.
 sweep_finished_tabs() {
-  local tabs worktrees tab num
+  local tabs tab bname num r p state any_closed keep
 
-  # Emit "<tab_id><TAB><issue number>" straight from jq. Do NOT parse the
-  # number out with sed: "\+" is a GNU extension that BSD sed (macOS) treats
-  # as a literal plus, so the number came back empty and nothing was ever
-  # swept — silently, because an empty number just skips the tab.
+  # Emit "<tab_id><TAB><board><TAB><issue number>" straight from jq. Do NOT
+  # parse the number out with sed: "\+" is a GNU extension that BSD sed
+  # (macOS) treats as a literal plus, so the number came back empty and
+  # nothing was ever swept — silently, because an empty number just skips
+  # the tab.
   tabs=$(herdr tab list 2>/dev/null \
          | jq -r '.result.tabs[]?
-                  | select(.label? // "" | test("^issue-[0-9]+:"))
-                  | "\(.tab_id)\t\(.label | capture("^issue-(?<n>[0-9]+):").n)"')
+                  | select(.label? // "" | test("^[a-z0-9-]+/issue-[0-9]+:"))
+                  | (.label | capture("^(?<b>[a-z0-9-]+)/issue-(?<n>[0-9]+):")) as $m
+                  | "\(.tab_id)\t\($m.b)\t\($m.n)"')
   [ -z "$tabs" ] && return 0
 
-  worktrees=$(git -C "$CUR_PATH" worktree list 2>/dev/null)
-
-  while IFS=$'\t' read -r tab num; do
+  while IFS=$'\t' read -r tab bname num; do
     [ -z "$tab" ] || [ -z "$num" ] && continue
+    [ "$bname" = "$CUR_NAME" ] || continue
 
-    # still holding a slot? then it is not finished
-    grep -qx "$num" <<<"$inflight" && continue
-
-    [ "$(gh issue view "$num" -R "$CUR_REPO" --json state --jq '.state' 2>/dev/null)" = "CLOSED" ] || continue
-    grep -qE "issue-$num([^0-9]|$)" <<<"$worktrees" && continue
+    keep=0
+    any_closed=0
+    while IFS=$'\t' read -r r p _ws; do
+      [ -z "$r" ] && continue
+      # still holding a slot? then it is not finished
+      grep -qxF "$r#$num" <<<"$inflight" && { keep=1; break; }
+      state=$(gh issue view "$num" -R "$r" --json state --jq '.state' 2>/dev/null)
+      case "$state" in
+        OPEN) keep=1; break ;;
+        CLOSED) any_closed=1 ;;
+      esac
+      git -C "$p" worktree list 2>/dev/null | grep -qE "issue-$num([^0-9]|$)" && { keep=1; break; }
+    done <<<"$CUR_REPOMAP"
+    [ "$keep" -eq 1 ] && continue
+    [ "$any_closed" -eq 1 ] || continue
 
     if herdr tab close "$tab" >/dev/null 2>&1; then
       log "issue #$num: closed finished tab $tab"
@@ -811,9 +935,9 @@ sweep_finished_tabs() {
 # or a closing keyword in the title/body. A bare "#N" mention is NOT enough —
 # PRs routinely name related issues ("related #97/#98/#99 work is not copied"),
 # and treating that as ownership hands a session the wrong branch.
-existing_pr_for() {
-  gh pr list -R "$CUR_REPO" --state open --json number,headRefName,title,body --limit 100 2>/dev/null \
-    | jq -r --arg n "$1" '
+existing_pr_for() { # <nwo> <num>
+  gh pr list -R "$1" --state open --json number,headRefName,title,body --limit 100 2>/dev/null \
+    | jq -r --arg n "$2" '
         [ .[]
           | select(
               (.headRefName | test("(^|[^0-9])" + $n + "([^0-9]|$)"))
@@ -825,21 +949,35 @@ existing_pr_for() {
 }
 
 # Prints a remote branch name already carrying this issue number, if any.
-existing_branch_for() {
-  git -C "$CUR_PATH" ls-remote --heads origin 2>/dev/null \
+existing_branch_for() { # <path> <num>
+  git -C "$1" ls-remote --heads origin 2>/dev/null \
     | sed 's#.*refs/heads/##' \
-    | grep -E "(^|[^0-9])$1([^0-9]|$)" \
+    | grep -E "(^|[^0-9])$2([^0-9]|$)" \
     | head -1
 }
 
 # Opens a tab, starts an omp agent, and hands it one specific, already-claimed
 # issue. Releases the claim and cleans up the tab if anything fails.
 launch_issue() {
-  local num="$1" title="$2"
+  local nwo="$1" num="$2" title="$3"
   local name create_json pane tab start_out attempt prompt
-  local pr_info pr_num pr_branch adopt branch_only
+  local pr_info pr_num pr_branch adopt branch_only item_path item_ws
 
-  name="issue-$num"
+  # Cross-repo dispatch: every downstream call for this item — the tab and
+  # its workspace, the PR/branch adoption lookups — runs against ITS OWN
+  # repo's checkout and workspace from the board's repo map, never the
+  # board's first repo. The backends only emit mapped repos, so a miss here
+  # is a watcher bug, not a config gap: release and surface it.
+  if ! item_path=$(repo_path "$CUR_IDX" "$nwo") || ! item_ws=$(repo_workspace "$CUR_IDX" "$nwo"); then
+    log "issue #$num: BUG: repo $nwo is not in board $CUR_NAME's repo map, releasing claim"
+    board_release "$nwo" "$num"
+    return 1
+  fi
+
+  # herdr agent names are global and two boards can both own an issue #12,
+  # so the board name namespaces the agent, and the tab label (which the
+  # sweep parses back apart) carries "<board>/issue-<n>".
+  name="$CUR_NAME-issue-$num"
 
   # NOTE: the pane id lives at .result.root_pane.pane_id, NOT .result.tab.pane_id
   # or .result.pane_id — those paths look plausible but don't exist, and jq
@@ -847,10 +985,10 @@ launch_issue() {
   # after the tab is already created, leaving a real, visible, agent-less tab
   # with no cleanup. Verified against a live `herdr tab create` response; do not
   # change without re-checking the actual response shape.
-  create_json=$(herdr tab create --workspace "$CUR_WS" --no-focus 2>&1) || {
+  create_json=$(herdr tab create --workspace "$item_ws" --no-focus 2>&1) || {
     log "issue #$num: tab create failed: $create_json"
     report "issue #$num could not start: tab create failed. Claim released, issue back in rotation."
-    board_release "$num"
+    board_release "$nwo" "$num"
     return 1
   }
   pane=$(jq -r '.result.root_pane.pane_id // empty' <<<"$create_json" 2>/dev/null)
@@ -858,7 +996,7 @@ launch_issue() {
   if [ -z "$pane" ] || [ -z "$tab" ]; then
     log "issue #$num: tab create returned no pane/tab id, response was: $create_json"
     report "issue #$num could not start: tab create returned no pane id. Claim released, issue back in rotation."
-    board_release "$num"
+    board_release "$nwo" "$num"
     return 1
   fi
 
@@ -880,21 +1018,21 @@ launch_issue() {
     log "issue #$num: agent start failed on pane $pane, closing tab $tab and releasing claim: $start_out"
     report "issue #$num could not start: agent start failed on pane $pane. Tab closed and claim released, issue back in rotation."
     herdr tab close "$tab" >/dev/null 2>&1
-    board_release "$num"
+    board_release "$nwo" "$num"
     return 1
   fi
 
-  herdr tab rename "$tab" "issue-$num: $title" >/dev/null 2>&1
+  herdr tab rename "$tab" "$CUR_NAME/issue-$num: $title" >/dev/null 2>&1
 
   # Hand over any work that already exists for this issue, so the session
   # adopts it instead of starting a second branch and a second PR beside it.
-  pr_info=$(existing_pr_for "$num")
+  pr_info=$(existing_pr_for "$nwo" "$num")
   pr_num=$(cut -f1 <<<"$pr_info")
   pr_branch=$(cut -f2 <<<"$pr_info")
   if [ -n "$pr_num" ]; then
     adopt="Work already exists and you are ADOPTING it: open PR #$pr_num on branch $pr_branch. Do not open a new PR and do not start over. Create your worktree from that existing branch, basing it on origin/$pr_branch, then read the issue and that PR (including comments) and the diff against origin/main to establish what is already done, including any uncommitted changes, before you add anything."
   else
-    branch_only=$(existing_branch_for "$num")
+    branch_only=$(existing_branch_for "$item_path" "$num")
     if [ -n "$branch_only" ]; then
       adopt="A branch for this issue already exists on origin with no open PR: $branch_only. Inspect it first (git log and diff against origin/main); adopt it and open the draft PR from it if its work is sound, and say so explicitly if you judge it unusable and start fresh instead."
     else
@@ -945,6 +1083,8 @@ $instructions"
 # and reports; the repo-mode strings are the original text, byte for byte.
 board_ctx_load() {
   local i="$1"
+  CUR_IDX=$i
+  bv "$i" REPOMAP; CUR_REPOMAP=$bvv
   bv "$i" NAME; CUR_NAME=$bvv
   bv "$i" KIND; CUR_KIND=$bvv
   bv "$i" REPO; CUR_REPO=$bvv
@@ -1005,26 +1145,34 @@ service_board_cycle() {
   [ -n "$inflight" ] && count=$(wc -l <<<"$inflight" | tr -d ' ')
   free=$(( CUR_CONC - count ))
 
+  # Refresh this board's contribution to the cross-board dedupe union with
+  # the fresh fetch, so boards serviced later this same cycle already see
+  # anything just observed (or just claimed by someone else) in flight here.
+  [ -n "$inflight" ] && CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$inflight" | sort -u)
+
   # Anything that left flight since the last cycle: landed, closed, or had its
   # claim dropped by someone else. Worth surfacing — a session landing its own
-  # issue is otherwise invisible from here.
+  # issue is otherwise invisible from here. Rows are "<nwo>#<num>" keys, so a
+  # cross-repo board's repos can reuse issue numbers without colliding.
   if [ "$first_cycle" -eq 0 ] && [ "$prev_inflight" != "$inflight" ]; then
     while read -r gone; do
       [ -z "$gone" ] && continue
-      state=$(gh issue view "$gone" -R "$CUR_REPO" --json state --jq '.state' 2>/dev/null)
+      g_nwo="${gone%%#*}"
+      g_num="${gone##*#}"
+      state=$(gh issue view "$g_num" -R "$g_nwo" --json state --jq '.state' 2>/dev/null)
       # Reconcile the finished issue's board state: repo mode strips a stale
       # mgr:in-flight, project mode moves the card to Done.
-      [ "$state" = "CLOSED" ] && board_finish "$gone"
+      [ "$state" = "CLOSED" ] && board_finish "$g_nwo" "$g_num"
       # Departure resets the age clock's memory: if the issue re-enters
       # flight, the first-sight path re-reads GitHub - including, in repo
       # mode, the timeline lookup that detects a re-claimed issue's new
       # start. That lookup now runs exactly when it can change the answer.
       flight_cache_drop "$gone"
-      grep -qx "$gone" <<<"$FLIGHT_SEEN_DEPART" \
+      grep -qxF "$gone" <<<"$FLIGHT_SEEN_DEPART" \
         || FLIGHT_SEEN_DEPART=$(printf '%s\n%s' "$FLIGHT_SEEN_DEPART" "$gone")
       # A card a human dragged out of In progress lands here too: it simply
       # left flight, this report covers it, and the human's move stands.
-      report "issue #$gone left flight (issue is now ${state:-unknown}). Slot freed."
+      report "issue #$g_num left flight (issue is now ${state:-unknown}). Slot freed."
     done <<<"$(comm -23 <(printf '%s\n' "$prev_inflight") <(printf '%s\n' "$inflight") 2>/dev/null)"
   fi
   prev_inflight="$inflight"
@@ -1039,68 +1187,79 @@ service_board_cycle() {
   # in-flight, never more than once for the same hour - even across watcher
   # restarts, since the durable clock is each issue's marker comment, not a
   # local file. FLIGHT_CACHE mirrors that record in memory (see its comment):
-  # GitHub is read once per flight period, written once per hour boundary,
-  # and a steady-state cycle costs zero extra gh calls.
+  # GitHub is read once per flight period, written once per hour boundary.
+  #
+  # The scan itself runs only every AGE_SCAN_SECONDS per board (cursor in
+  # BOARD_<i>_AGE_NEXT, offset per board at startup): the notices are hourly,
+  # so scanning every poll bought nothing but first-sight reads N times
+  # sooner. Departures still drop cache rows every cycle above, so a
+  # re-claimed issue's next scan re-reads GitHub exactly as before.
   now_epoch=$(date -u +%s)
-  while read -r num; do
-    [ -z "$num" ] && continue
+  bv "$CUR_IDX" AGE_NEXT
+  if [ "$now_epoch" -ge "$bvv" ]; then
+    bset "$CUR_IDX" AGE_NEXT $((now_epoch + AGE_SCAN_SECONDS))
+    while read -r key; do
+      [ -z "$key" ] && continue
+      f_nwo="${key%%#*}"
+      num="${key##*#}"
 
-    row=$(flight_cache_row "$num")
-    if [ -n "$row" ]; then
-      # Seen in flight before, and not departed since: serve from memory.
-      IFS=$'\t' read -r _ start_iso start_epoch hours_reported comment_id <<<"$row"
-      need_write=0
-    else
-      # First sight of this flight period: read the durable record back.
-      comment_id="" start_iso="" hours_reported=0
-      marker=$(age_comment_for "$num")
-      [ -n "$marker" ] && IFS=$'\t' read -r comment_id start_iso hours_reported <<<"$marker"
+      row=$(flight_cache_row "$key")
+      if [ -n "$row" ]; then
+        # Seen in flight before, and not departed since: serve from memory.
+        IFS=$'\t' read -r _ start_iso start_epoch hours_reported comment_id <<<"$row"
+        need_write=0
+      else
+        # First sight of this flight period: read the durable record back.
+        comment_id="" start_iso="" hours_reported=0
+        marker=$(age_comment_for "$f_nwo" "$num")
+        [ -n "$marker" ] && IFS=$'\t' read -r comment_id start_iso hours_reported <<<"$marker"
 
-      # The mgr:in-flight timeline is the source of truth for when the
-      # CURRENT flight period began. A marker comment surviving from an
-      # earlier period (the issue left flight and was later re-claimed)
-      # would otherwise report a bogus multi-day duration, so a labeling
-      # event newer than our recorded start resets the clock. Project mode
-      # has no labeling events to consult: there, a re-entry observed by
-      # this process resets the clock to now, and after a restart the
-      # marker's own recorded start stands.
-      latest_iso=""
-      if [ "$CUR_KIND" = "repo" ]; then
-        latest_iso=$(fetch_start_iso "$num")
-      elif grep -qx "$num" <<<"$FLIGHT_SEEN_DEPART"; then
-        latest_iso=$(date -u +%FT%TZ)
+        # The mgr:in-flight timeline is the source of truth for when the
+        # CURRENT flight period began. A marker comment surviving from an
+        # earlier period (the issue left flight and was later re-claimed)
+        # would otherwise report a bogus multi-day duration, so a labeling
+        # event newer than our recorded start resets the clock. Project mode
+        # has no labeling events to consult: there, a re-entry observed by
+        # this process resets the clock to now, and after a restart the
+        # marker's own recorded start stands.
+        latest_iso=""
+        if [ "$CUR_KIND" = "repo" ]; then
+          latest_iso=$(fetch_start_iso "$f_nwo" "$num")
+        elif grep -qxF "$key" <<<"$FLIGHT_SEEN_DEPART"; then
+          latest_iso=$(date -u +%FT%TZ)
+        fi
+        need_write=0
+        [ -z "$comment_id" ] && need_write=1
+        if [ -z "$start_iso" ] || { [ -n "$latest_iso" ] && [ "$latest_iso" \> "$start_iso" ]; }; then
+          start_iso="${latest_iso:-$(date -u +%FT%TZ)}"
+          hours_reported=0
+          need_write=1
+        fi
+        start_epoch=$(iso_to_epoch "$start_iso") || start_epoch=$now_epoch
+        [ -z "$start_epoch" ] && start_epoch=$now_epoch
       fi
-      need_write=0
-      [ -z "$comment_id" ] && need_write=1
-      if [ -z "$start_iso" ] || { [ -n "$latest_iso" ] && [ "$latest_iso" \> "$start_iso" ]; }; then
-        start_iso="${latest_iso:-$(date -u +%FT%TZ)}"
-        hours_reported=0
+
+      elapsed_hours=$(( (now_epoch - start_epoch) / 3600 ))
+      if [ "$elapsed_hours" -gt "$hours_reported" ]; then
+        title=$(title_for "$f_nwo" "$num")
+        log "issue #$num has been in flight for ${elapsed_hours}h: $title"
+        report "issue #$num has been in flight for ${elapsed_hours}h: $title."
+        hours_reported=$elapsed_hours
         need_write=1
       fi
-      start_epoch=$(iso_to_epoch "$start_iso") || start_epoch=$now_epoch
-      [ -z "$start_epoch" ] && start_epoch=$now_epoch
-    fi
 
-    elapsed_hours=$(( (now_epoch - start_epoch) / 3600 ))
-    if [ "$elapsed_hours" -gt "$hours_reported" ]; then
-      title=$(title_for "$num")
-      log "issue #$num has been in flight for ${elapsed_hours}h: $title"
-      report "issue #$num has been in flight for ${elapsed_hours}h: $title."
-      hours_reported=$elapsed_hours
-      need_write=1
-    fi
-
-    if [ "$need_write" -eq 1 ]; then
-      if [ -n "$comment_id" ]; then
-        update_flight_comment "$comment_id" "$(flight_comment_body "$start_iso" "$hours_reported")"
-      else
-        comment_id=$(create_flight_comment "$num" "$(flight_comment_body "$start_iso" "$hours_reported")")
+      if [ "$need_write" -eq 1 ]; then
+        if [ -n "$comment_id" ]; then
+          update_flight_comment "$f_nwo" "$comment_id" "$(flight_comment_body "$start_iso" "$hours_reported")"
+        else
+          comment_id=$(create_flight_comment "$f_nwo" "$num" "$(flight_comment_body "$start_iso" "$hours_reported")")
+        fi
+        flight_cache_put "$key" "$start_iso" "$start_epoch" "$hours_reported" "$comment_id"
+      elif [ -z "$row" ]; then
+        flight_cache_put "$key" "$start_iso" "$start_epoch" "$hours_reported" "$comment_id"
       fi
-      flight_cache_put "$num" "$start_iso" "$start_epoch" "$hours_reported" "$comment_id"
-    elif [ -z "$row" ]; then
-      flight_cache_put "$num" "$start_iso" "$start_epoch" "$hours_reported" "$comment_id"
-    fi
-  done <<<"$inflight"
+    done <<<"$inflight"
+  fi
 
   if ! ready_list=$(board_ready); then
     log "board $CUR_NAME: ready fetch failed: $(cat "$ERRFILE")"
@@ -1117,19 +1276,42 @@ service_board_cycle() {
 
   if [ "$launch" -gt 0 ]; then
     launched=0
-    while IFS=$'\t' read -r num title; do
+    while IFS=$'\t' read -r nwo num title; do
       [ "$launched" -ge "$launch" ] && break
       [ -z "$num" ] && continue
-      if ! board_claim "$num"; then
+      # Cross-board dedupe: an issue legitimately sitting on two boards (a
+      # label board and a project board, say) must still run only once.
+      # First in-flight sighting or first claim this cycle wins; the loser
+      # skips quietly - a log line, not an operator report.
+      if grep -qxF "$nwo#$num" <<<"$CYCLE_SEEN"; then
+        log "issue #$num ($nwo): already in flight on another board, skipping"
+        continue
+      fi
+      if ! board_claim "$nwo" "$num"; then
         log "issue #$num: claim failed (raced?), skipping"
         report "issue #$num: could not claim $CLAIM_NOUN (raced with another session?), skipped this cycle."
         continue
       fi
-      launch_issue "$num" "$title" || true
+      CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
+      launch_issue "$nwo" "$num" "$title" || true
       launched=$((launched + 1))
     done <<<"$ready_list"
   fi
   return 0
+}
+
+# Classifies the raw stderr left in $ERRFILE into a short operator-readable
+# class for the latched degraded report; the full raw error is already in
+# the watcher log from the failing cycle itself.
+err_class() {
+  local e
+  e=$(cat "$ERRFILE" 2>/dev/null)
+  case "$e" in
+    *"missing required scopes"*|*"Bad credentials"*|*uthentication*|*"HTTP 401"*|*"HTTP 403"*) printf 'auth failure\n' ;;
+    *"rate limit"*|*"HTTP 429"*) printf 'rate limited\n' ;;
+    *"Could not resolve"*|*"no such host"*|*"connection refused"*|*"dial tcp"*|*imeout*|*"TLS"*) printf 'network failure\n' ;;
+    *) printf 'fetch failure\n' ;;
+  esac
 }
 
 service_board() {
@@ -1139,25 +1321,29 @@ service_board() {
   # serviced only every 10th cycle — failed calls still burn rate limit and
   # the raw error is already in the log. Any success resets the count.
   if [ "$fails" -ge 5 ]; then
-    bv "$i" SKIP; skip=$bvv
+    bv "$i" BACKOFF; skip=$bvv
     if [ "$skip" -lt 9 ]; then
-      bset "$i" SKIP $((skip + 1))
+      bset "$i" BACKOFF $((skip + 1))
       return 0
     fi
-    bset "$i" SKIP 0
+    bset "$i" BACKOFF 0
   fi
   board_ctx_load "$i"
   board_state_load "$i"
   service_board_cycle
   rc=$?
   board_state_save "$i"
+  # Latched degraded/recovered reports: fired on state ENTRY (the 3rd
+  # consecutive failed cycle) and on state EXIT (the first success after),
+  # never repeated while the state holds. The every-cycle raw error stays
+  # log-only.
   if [ "$rc" -ne 0 ]; then
     bset "$i" FAILS $((fails + 1))
-  elif [ "$fails" -ne 0 ]; then
-    bset "$i" FAILS 0
+    [ $((fails + 1)) -eq 3 ] && report "degraded: $(err_class)"
+  else
+    [ "$fails" -ge 3 ] && report "recovered"
+    [ "$fails" -ne 0 ] && bset "$i" FAILS 0
   fi
-  # Wave-2 seam: the latched degraded/recovered operator reports fire here,
-  # on the FAILS 0 <-> threshold transitions. Not implemented in wave 1.
   return "$rc"
 }
 
@@ -1168,25 +1354,31 @@ while [ "$b" -lt "$NBOARDS" ]; do
   if [ "$CUR_KIND" = "project" ]; then
     log "board mode: project $CUR_OWNER/$CUR_NUMBER - the Status single-select is the state machine; labels are not board state"
   fi
-  if [ "$CUR_MODE" = "auto" ]; then
-    report "started in AUTO mode: concurrency $CUR_CONC, polling every ${POLL_SECONDS}s. Sessions will plan (tier 2 if complex), implement, run a mandatory tier 2 review, then land and finish on their own. mgr:manual-approve still gates the merge: an issue carrying it is left ready for approval, not landed. Will report launches, landings and failures here."
-  else
-    report "started in supervised mode: concurrency $CUR_CONC, polling every ${POLL_SECONDS}s. Sessions stop after pushing; you instruct ready/land/done in each issue tab. Will report launches and failures here."
-  fi
   b=$((b + 1))
 done
 
+# ONE consolidated startup report listing every board — N per-board
+# messages would wake the operator session N times to say the same thing.
+report_raw "started: $NBOARDS board(s), polling every ${POLL_SECONDS}s.$BOARDS_SUMMARY
+Supervised boards stop after pushing - you instruct ready/land/done in each issue tab. Auto boards plan, implement, run a mandatory tier 2 review, then land on their own; mgr:manual-approve still gates those merges. Launches, departures, hourly age notices and failures are reported here per board."
+
 # The operator's total load, as one visible number: concurrency summed across
-# the config, and the steady-state gh request rate (2 fetches per board per
-# cycle — in-flight + ready in repo mode, item-list + open-issue list in
-# project mode; launches, sweeps and age writes come on top).
+# the config, and the steady-state gh request rate (repo mode: in-flight +
+# ready fetches; project mode: item-list + one open-issue list per mapped
+# repo; launches, sweeps and the every-600s flight-age scans come on top).
 TOTAL_CONC=0
 CALLS_PER_CYCLE=0
 b=0
 while [ "$b" -lt "$NBOARDS" ]; do
   bv "$b" CONC
   TOTAL_CONC=$((TOTAL_CONC + bvv))
-  CALLS_PER_CYCLE=$((CALLS_PER_CYCLE + 2))
+  bv "$b" KIND
+  if [ "$bvv" = "project" ]; then
+    bv "$b" REPOMAP
+    CALLS_PER_CYCLE=$((CALLS_PER_CYCLE + 1 + $(wc -l <<<"$bvv" | tr -d ' ')))
+  else
+    CALLS_PER_CYCLE=$((CALLS_PER_CYCLE + 2))
+  fi
   b=$((b + 1))
 done
 EST_RPH=$((CALLS_PER_CYCLE * 3600 / POLL_SECONDS))
@@ -1196,6 +1388,19 @@ if [ "$EST_RPH" -gt 3000 ]; then
 fi
 
 while true; do
+  # Cross-board dedupe union for THIS cycle: every board's last-observed
+  # in-flight "<nwo>#<num>" keys. Each board refreshes its own contribution
+  # when its fresh fetch lands, and claims append immediately (see the
+  # launch loop) — the only cross-board coupling in the watcher, read-only
+  # apart from those insertions.
+  CYCLE_SEEN=""
+  b=0
+  while [ "$b" -lt "$NBOARDS" ]; do
+    bv "$b" PREV_INFLIGHT
+    [ -n "$bvv" ] && CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$bvv")
+    b=$((b + 1))
+  done
+
   b=0
   while [ "$b" -lt "$NBOARDS" ]; do
     service_board "$b" || true
