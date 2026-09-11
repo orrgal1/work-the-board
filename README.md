@@ -19,6 +19,14 @@ cycle it counts issues labelled `mgr:in-flight`, selects the ready ones, claims 
 slot's worth, and launches a session per issue that follows `next-issue`. Sessions plan
 and review through `plan-on-tier` / `review-on-tier`.
 
+**Concurrency is yours to set and is never defaulted.** Say it when you start the board
+— "work the board, 3 at a time" — or the session asks before launching anything. It
+becomes the watcher's ceiling: each cycle it counts open issues labelled
+`mgr:in-flight`, launches at most `ceiling - in-flight` sessions, and launches nothing
+when the board is full or nothing is ready. Only `mgr:in-flight` consumes a slot, so a
+stale claim costs you capacity until it is cleared. Changing the limit means restarting
+the watcher; already-running sessions keep going.
+
 Two modes: `supervised` stops each session after it pushes, leaving `ready`/`land`/`done`
 to the operator in that issue's own tab; `auto` lets a session plan, implement, review,
 and land on its own. `mgr:manual-approve` blocks a self-merge in either mode.
