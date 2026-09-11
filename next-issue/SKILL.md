@@ -19,15 +19,26 @@ Ready = open, carrying none of `mgr:in-flight`, `mgr:hold`, `research`, and ever
 then lowest issue number. If nothing is ready, report why (all blocked / all in-flight /
 all held / none open) and stop — do not invent one.
 
-Claim it immediately to prevent double-pick:
+**Board is a GitHub Project?** Readiness is the Status field instead of labels: `Todo`
+is the ready pool, `In progress` is in flight, `Blocked` is a hold. The `research` label,
+`mgr:manual-approve`, and the `Blocked by: #N` body rule still apply exactly as above.
+Inspect by hand with `gh project item-list <number> --owner <owner> --format json`.
+
+Claim it immediately to prevent double-pick (repo mode only):
 
 ```bash
 gh issue edit <N> --add-label mgr:in-flight
 ```
 
+In project mode, do not add or remove `mgr:in-flight` and do not touch Status yourself —
+the watcher is the only writer of Status. A session handed a project-board issue by the
+watcher does nothing at all to board state when claiming or releasing it. Running
+standalone against a project board with no watcher active: nothing will move the card,
+so say so plainly and let the operator set Status themselves.
+
 **Handed a specific issue?** If a caller (e.g. `work-the-board`) names the issue number
-as already claimed, skip this step (verify it still carries `mgr:in-flight`) and go
-straight to step 2.
+as already claimed, skip this step (verify it still carries `mgr:in-flight` in repo mode,
+or `In progress` in project mode) and go straight to step 2.
 
 ## 2. Create the worktree and rename the tab
 
@@ -77,6 +88,9 @@ gh pr merge <PR_N> --squash --delete-branch
 gh issue close <N> --comment "Landed in <PR_URL>."
 gh issue edit <N> --remove-label mgr:in-flight
 ```
+
+Project mode: skip that last label removal — the watcher reconciles the closed issue's
+card to `Done` on its own.
 
 Confirm the merge succeeded (`gh pr view <PR_N> --json state`) before closing the issue.
 

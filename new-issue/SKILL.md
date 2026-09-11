@@ -51,6 +51,20 @@ Also set the lane label if it applies — both keep the issue out of automatic p
 - `mgr:hold` — nobody should build it yet (operator-owned, or waiting on an outside
   answer). Blocks pickup, costs no concurrency slot. Always comment why.
 
+**Board is a GitHub Project?** Labels are not read for board state; add the issue and put
+it in the ready pool instead:
+
+```bash
+gh project item-add <number> --owner <owner> --url <issue url>
+```
+
+Then set its Status field to `Todo` via `gh project item-edit` (it needs the project,
+field, and single-select-option ids from
+`gh project field-list <number> --owner <owner> --format json`). `Blocked by:` on the
+body still expresses dependencies in both modes — the project has no dependency field the
+watcher reads. `gh project item-add`/`item-edit` need the `project` scope; if missing,
+`gh auth refresh -s project`.
+
 ## Output
 
 Report: issue number/URL, dedupe verdict (created / merged-into-existing / linked-as-related),
