@@ -28,6 +28,18 @@ when the board is full or nothing is ready. Only `mgr:in-flight` consumes a slot
 stale claim costs you capacity until it is cleared. Changing the limit means restarting
 the watcher; already-running sessions keep going.
 
+**Several boards, one process.** Pass `--config <file>` instead of the positional args to run several boards — independent repos, a Projects v2 board that spans repos, or a mix — from one watcher. Concurrency is set per board with no global cap; a project board's `repos` array lets it dispatch each item into its own repo's checkout and workspace. Minimal two-board example:
+
+```json
+{ "boards": [
+  { "name": "harness", "kind": "repo", "repo": "owner/repo",
+    "path": "/abs/checkout", "workspace": "ws_abc", "concurrency": 3 },
+  { "name": "platform", "kind": "project", "owner": "me", "number": 7,
+    "concurrency": 2,
+    "repos": [ { "repo": "owner/repo", "path": "/abs/checkout", "workspace": "ws_abc" } ] }
+] }
+```
+
 Two modes: `supervised` stops each session after it pushes, leaving `ready`/`land`/`done`
 to the operator in that issue's own tab; `auto` lets a session plan, implement, review,
 and land on its own. `mgr:manual-approve` blocks a self-merge in either mode.

@@ -40,6 +40,8 @@ so say so plainly and let the operator set Status themselves.
 as already claimed, skip this step (verify it still carries `mgr:in-flight` in repo mode,
 or `In progress` in project mode) and go straight to step 2.
 
+**Handed a tab by `work-the-board`?** With multi-board configs the watcher names the tab `<board>/issue-<N>: <title>` and the agent `<board>-issue-<N>` — use those exact names rather than deriving `issue-<N>` yourself.
+
 ## 2. Create the worktree and rename the tab
 
 ```bash

@@ -11,7 +11,7 @@ Keep a fixed count of issues in flight, hands-off: poll the board, select and cl
 
 ## 1. Get concurrency and mode
 
-Use the concurrency the operator gave; if none was given, ask before starting anything — do not default or guess.
+Concurrency and mode are per board, required, never defaulted. For one board, use the concurrency the operator gave; if none was given, ask before starting anything — do not default or guess. For several boards, the operator supplies concurrency and mode for each board in the config file (see "Running several boards" below); there is no session-wide default to fall back on for any of them.
 
 Mode is `supervised` unless the operator asks for autonomy ("auto mode", "land them yourself", "don't ask me") — landing without approval is not reversible.
 
@@ -71,9 +71,32 @@ In project mode, run the same audit over the board's `In progress` cards instead
 
 A hold parked under `mgr:in-flight` silently eats a build slot — keep the two straight. When a `research` issue closes, check what it unblocked before letting the board run: work that resolves by a human act (a signup, an account, an approval) can look ready to the filter while being nobody's diff — give it `mgr:hold` and a comment instead.
 
+## Running several boards
+
+Use one watcher process for several boards when: independent boards run over one repo, one project board spans repos, or several repos need boards in the same session. Pass `--config <file>` instead of the positional args and mode; the file is loaded and validated once at startup and never re-read — changing it means restarting the watcher.
+
+```json
+{
+  "poll_seconds": 30,
+  "report_agent": "board",
+  "boards": [
+    { "name": "harness", "kind": "repo", "repo": "owner/repo",
+      "path": "/abs/checkout", "workspace": "ws_abc",
+      "concurrency": 3, "mode": "supervised" },
+    { "name": "platform", "kind": "project", "owner": "me", "number": 7,
+      "concurrency": 2, "mode": "auto",
+      "repos": [ { "repo": "owner/repo", "path": "/abs/checkout", "workspace": "ws_abc" } ] }
+  ]
+}
+```
+
+`poll_seconds` (optional, default 30) and `report_agent` (optional) are watcher-wide. Each board needs a unique `name` matching `^[a-z0-9-]+$` (it labels that board's tabs and agents), a `kind` (`repo` or `project`), and `concurrency` — required, never defaulted, per board. `mode` defaults `supervised`. A `repo` board additionally needs `repo` (`owner/repo`), `path`, `workspace`. A `project` board needs `owner`, `number`, and a non-empty `repos` array of `{repo, path, workspace}` — one entry per repo the board spans.
+
+Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
+
 ## 4. Start the watcher
 
-Read the current workspace id once (`herdr pane current`). Start the bundled script as a persistent background process — do not hand-roll the poll loop inline:
+Read the current workspace id once (`herdr pane current`). Start the bundled script as a persistent background process — do not hand-roll the poll loop inline. One board — this form is unchanged, not deprecated:
 
 ```
 hub op="start" name="<project>-work-the-board" application="bash" \
@@ -83,6 +106,16 @@ hub op="start" name="<project>-work-the-board" application="bash" \
 
 `<skill-dir>` is this skill's absolute directory (given in the invocation prompt's "Skill directory" footer). Args are workspace, concurrency, poll seconds, the report target (pass `board`, see "Reporting"), and the mode (`supervised`/`auto`; unknown mode exits 2). Append the trailing `--project <owner>/<number>` pair only in project mode. A malformed `--project` value, a board missing the Status field or its `Todo`/`In progress` options, or a token without the `project` scope exits 2 at startup with the reason.
 
+Several boards: write the config file (see "Running several boards" above) and pass it instead — `--config` cannot combine with positional args or `--project`:
+
+```
+hub op="start" name="<project>-work-the-board" application="bash" \
+  args=["<skill-dir>/scripts/watch.sh", "--config", "<CONFIG_FILE>"] \
+  cwd="<project dir>" restart="on-failure" persist=true
+```
+
+Either way, check the log right after starting (`hub`, `op: "logs"`): it prints the total concurrency across boards and an estimated gh requests/hour, and warns when that estimate is above 3000/h — if it does, raise `poll_seconds` in the config (or the positional poll-seconds argument) and restart.
+
 Switching mode restarts the watcher and only affects sessions launched afterwards; steer already-running ones directly (`herdr agent prompt <issue-N> "..."`) if needed.
 
 The script does, every cycle:
@@ -90,17 +123,21 @@ The script does, every cycle:
 1. Counts open issues labeled `mgr:in-flight` — capacity in use.
 2. Selects the **ready** issues: open, carrying none of `mgr:in-flight`, `mgr:hold`, `research`, and every `Blocked by: #N` reference either absent or itself closed. Ordered `priority:high` first, then lowest issue number.
 3. Looks for work that already exists for that issue — an open PR whose head branch carries the number or whose title/body *closes* it, else a remote branch carrying the number — so the session **adopts** it instead of opening a second branch and PR. A bare `#N` mention is not enough: PRs routinely name related issues.
-4. For each free slot, takes the next ready issue, **claims it** with `mgr:in-flight`, opens a tab, starts an `omp` agent, renames the tab `issue-<N>: <title>`, and hands it the issue number plus adoption instructions. A session that fails to come up has its tab closed and its claim **released**.
+4. For each free slot, takes the next ready issue, **claims it** with `mgr:in-flight`, opens a tab, starts an `omp` agent, renames the tab `<board>/issue-<N>: <title>`, and hands it the issue number plus adoption instructions. The agent is named `<board>-issue-<N>` (herdr agent names are global, so the board name keeps two boards' issue #12 apart). A session that fails to come up has its tab closed and its claim **released**.
 5. Sweeps finished tabs (below).
 6. Sleeps, then repeats.
 
 In project mode, swap Status for labels in 1–2 and 4: capacity = open `In progress` cards, ready = open `Todo` items (same `research` and `Blocked by` rules, same ordering), claim/release = Status edits, and a closed issue's card is reconciled to `Done`. Labels are never read or written for board state.
 
+With several boards, each is serviced inside its own error boundary: one board's failure never stops the others. A fetch failure is distinguished from a genuinely empty board, so an expired token or dead remote reports as an error instead of looking idle — three consecutive failed cycles produce one latched `[<board>] degraded: <reason>` report, and the next success emits one `[<board>] recovered`; once a board is well past that (five straight failures) it is only serviced every tenth cycle, so a broken board stops burning rate limit.
+
+A project board's items are dispatched into their own mapped repo's `path` and `workspace` — a project board spanning repos runs each item where that repo's `repos` entry points. An item whose repo isn't in the board's `repos` map is skipped and left untouched in `Todo`, reported once per (board, repo) — never held on the operator's behalf. The same issue sitting on two boards at once (a label board and a project board, say) is claimed only once: whichever board sees it in flight or claims it first wins, the other skips it quietly.
+
 **The watcher owns selection and claiming.** Do not spawn a generic session and let it find its own issue — that spawns a throwaway agent and tab every cycle when nothing is ready. Pre-claiming also closes the double-pick race between concurrent launches.
 
 `watch.sh` encodes several `herdr`/`jq` response-shape and shell-quoting pitfalls — see its comments. Reuse it verbatim rather than re-deriving them.
 
-**Reporting.** With a report target, the watcher prompts that agent on material changes only: started/stopped; an issue launched (number, title, tab) and claimed; an issue that **left flight** — landed, closed, or claim dropped elsewhere — with its new state (the only way a session landing its own issue becomes visible from here); any launch failure, and whether the claim was released; and an issue that has been in flight for over an hour, repeated on every further hour boundary it crosses (state for this lives in a hidden marker comment on the issue itself, not a local file, so it survives a watcher restart). Idle cycles are never reported. Sends are fire-and-forget, never `--wait`, so a busy board session cannot stall the loop. Relay these to the operator; they are the board's audit trail.
+**Reporting.** Every report line is prefixed `[<board-name>]`, so with several boards in one process you can tell them apart — `[harness] issue #42 launched...`. With a report target, the watcher prompts that agent on material changes only: an issue launched (number, title, tab) and claimed; an issue that **left flight** — landed, closed, or claim dropped elsewhere — with its new state (the only way a session landing its own issue becomes visible from here); any launch failure, and whether the claim was released; a board going degraded or recovering (above); and an issue that has been in flight for over an hour, repeated on every further hour boundary it crosses (state for this lives in a hidden marker comment on the issue itself, not a local file, so it survives a watcher restart). Idle cycles are never reported. Sends are fire-and-forget, never `--wait`, so a busy board session cannot stall the loop. Startup and stop each send one consolidated, unprefixed message covering every configured board, not one message per board. Relay these to the operator; they are the board's audit trail.
 
 **Landing is the operator's call.** The handed-over prompt tells a supervised session to stop after pushing and leave `gh pr ready`, merging, closing and worktree removal to explicit instruction given **in the issue's own tab** (`land`, `ready`, `done`) — the board session never sees it. So a `left flight (issue is now CLOSED)` report is normally the operator landing it directly; before raising an alarm, check the owning session's transcript (`herdr agent list` gives its `agent_session` path) rather than the board:
 
@@ -108,7 +145,7 @@ In project mode, swap Status for labels in 1–2 and 4: capacity = open `In prog
 grep -n '"attribution":"user"' <session>.jsonl   # what the operator actually typed, and when
 ```
 
-**Tab lifecycle.** On `done` the session removes its own worktree, then closes its own tab. The watcher's sweep is only a backstop for a session that dies, is killed, or exits before teardown: it closes an `issue-<N>:` tab once that issue is CLOSED and its worktree is gone, every cycle. More working tabs than `mgr:in-flight` issues is normal, not a leak — a session outlives its claim (it drops the label and closes the issue on landing, then may keep working, e.g. a post-land review, until it exits).
+**Tab lifecycle.** On `done` the session removes its own worktree, then closes its own tab. The watcher's sweep is only a backstop for a session that dies, is killed, or exits before teardown: it closes a `<board>/issue-<N>:` tab once that issue is CLOSED and its worktree is gone, every cycle. More working tabs than `mgr:in-flight` issues is normal, not a leak — a session outlives its claim (it drops the label and closes the issue on landing, then may keep working, e.g. a post-land review, until it exits). Tabs opened before this change carry the old `issue-<N>:` label and no longer match the sweep — do one manual `herdr tab rename`/close pass on any still open.
 
 ## 5. Verify one cycle
 
