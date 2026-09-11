@@ -26,6 +26,8 @@ In auto mode the handout prompt states that it *is* the explicit instruction `ne
 
 The watcher never treats `mgr:manual-approve` as stale: an auto session that hits it leaves the PR ready and reports it waiting on approval instead of landing it. If the operator declares the label stale on this board, clear it off the open issues yourself (step 3) before starting the watcher.
 
+**Board mode.** Repo mode (default): the `mgr:*` labels below are the state machine. If the operator names a Projects v2 board ("work the board on project acme/7"), start the watcher with the trailing flag `--project <owner>/<number>` — project mode exists for multiple independent boards over one repo, or one board spanning repos. There the board's single-select **Status** replaces the `mgr:*` capacity labels: `Todo` = ready pool, `In progress` = in flight (the only status counting against concurrency), `Blocked` = hold (no pickup, no slot), `Done` = finished. `research`, `mgr:manual-approve`, and the `Blocked by: #N` body rule are issue properties, not board state — they apply unchanged in both modes. The watcher is the only Status writer: it claims to `In progress`, restores `Todo` on a failed launch, and moves a CLOSED issue's card to `Done`; sessions never touch Status, and a human dragging a card is authoritative — the watcher observes and reports the move, never fights it. Prerequisite: the gh token needs the `project` scope, or the watcher exits at startup naming the remedy (`gh auth refresh -s project`).
+
 ## 2. Name this tab and agent
 
 Rename this session's own tab to `board`, and give its agent the same name so the watcher can report back to it:
@@ -57,6 +59,8 @@ For each one, classify and act:
 
 Do not blanket-clear the label without checking each issue against the table above. Also expect merged PRs whose body never said `Closes #N` — GitHub never auto-closed those, which is how stale ones accumulate.
 
+In project mode, run the same audit over the board's `In progress` cards instead — Status edits (drag to `Todo`/`Blocked`) take the place of label edits.
+
 **What the labels mean here:**
 
 - `mgr:in-flight` — a builder owns it. The only label that counts against concurrency. Set at hand-off, cleared on landing.
@@ -73,11 +77,11 @@ Read the current workspace id once (`herdr pane current`). Start the bundled scr
 
 ```
 hub op="start" name="<project>-work-the-board" application="bash" \
-  args=["<skill-dir>/scripts/watch.sh", "<WORKSPACE_ID>", "<CONCURRENCY>", "30", "board", "<MODE>"] \
+  args=["<skill-dir>/scripts/watch.sh", "<WORKSPACE_ID>", "<CONCURRENCY>", "30", "board", "<MODE>", "--project", "<owner>/<number>"] \
   cwd="<project dir>" restart="on-failure" persist=true
 ```
 
-`<skill-dir>` is this skill's absolute directory (given in the invocation prompt's "Skill directory" footer). Args are workspace, concurrency, poll seconds, the report target (pass `board`, see "Reporting"), and the mode (`supervised`/`auto`; unknown mode exits 2).
+`<skill-dir>` is this skill's absolute directory (given in the invocation prompt's "Skill directory" footer). Args are workspace, concurrency, poll seconds, the report target (pass `board`, see "Reporting"), and the mode (`supervised`/`auto`; unknown mode exits 2). Append the trailing `--project <owner>/<number>` pair only in project mode. A malformed `--project` value, a board missing the Status field or its `Todo`/`In progress` options, or a token without the `project` scope exits 2 at startup with the reason.
 
 Switching mode restarts the watcher and only affects sessions launched afterwards; steer already-running ones directly (`herdr agent prompt <issue-N> "..."`) if needed.
 
@@ -89,6 +93,8 @@ The script does, every cycle:
 4. For each free slot, takes the next ready issue, **claims it** with `mgr:in-flight`, opens a tab, starts an `omp` agent, renames the tab `issue-<N>: <title>`, and hands it the issue number plus adoption instructions. A session that fails to come up has its tab closed and its claim **released**.
 5. Sweeps finished tabs (below).
 6. Sleeps, then repeats.
+
+In project mode, swap Status for labels in 1–2 and 4: capacity = open `In progress` cards, ready = open `Todo` items (same `research` and `Blocked by` rules, same ordering), claim/release = Status edits, and a closed issue's card is reconciled to `Done`. Labels are never read or written for board state.
 
 **The watcher owns selection and claiming.** Do not spawn a generic session and let it find its own issue — that spawns a throwaway agent and tab every cycle when nothing is ready. Pre-claiming also closes the double-pick race between concurrent launches.
 
