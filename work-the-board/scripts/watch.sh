@@ -105,6 +105,83 @@ ready_issues() {
 claim_issue() { gh issue edit "$1" --add-label mgr:in-flight >/dev/null 2>&1; }
 release_issue() { gh issue edit "$1" --remove-label mgr:in-flight >/dev/null 2>&1; }
 
+# Converts an ISO-8601 UTC timestamp ("2026-09-10T12:00:00Z") to epoch
+# seconds. BSD date (macOS) and GNU date (Linux) take incompatible flags for
+# this: try BSD's first, then GNU's.
+iso_to_epoch() {
+  date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null \
+    || date -u -d "$1" +%s 2>/dev/null
+}
+
+# First time we see an issue in flight with no recorded start, ask GitHub
+# when mgr:in-flight was actually applied rather than assuming "now" — the
+# issue may have been claimed before this watcher started, or by a prior
+# run (or since a marker comment's own recorded start, by a prior flight
+# period). Falls back to now if the timeline has no such event or the call
+# fails. Returns an ISO-8601 UTC timestamp, GitHub's own format.
+fetch_start_iso() {
+  local num="$1" ts
+  ts=$(gh api "repos/{owner}/{repo}/issues/$num/timeline" \
+        --jq '[.[] | select(.event=="labeled" and .label.name=="mgr:in-flight") | .created_at] | last' \
+        2>/dev/null)
+  if [ -n "$ts" ] && [ "$ts" != "null" ]; then
+    printf '%s' "$ts"
+  else
+    date -u +%FT%TZ
+  fi
+}
+
+# State for the long-running-issue notices lives on the issue itself, as a
+# single hidden-marker comment, so it survives a watcher restart, a wiped
+# /tmp, or a machine change, and a human can read it: GitHub is the source
+# of truth, not a local file.
+FLIGHT_MARKER='<!-- work-the-board:flight -->'
+
+# Prints "<comment_id><TAB><start_iso><TAB><hours_reported>" for issue $1's
+# marker comment, or nothing if it has none yet. The comment id is parsed
+# out of the comment's HTML URL ("...#issuecomment-<id>") since `gh issue
+# view --json comments` exposes only the GraphQL node id, not the numeric
+# id the REST PATCH endpoint needs.
+age_comment_for() {
+  local num="$1" data url body cid start hours
+  data=$(gh issue view "$num" --json comments --jq \
+    '[.comments[] | select(.body | startswith("'"$FLIGHT_MARKER"'"))] | last
+     | if . == null then empty else "\(.url)\u0001\(.body)" end' \
+    2>/dev/null)
+  [ -z "$data" ] && return 0
+  url="${data%%$'\x01'*}"
+  body="${data#*$'\x01'}"
+  cid="${url##*#issuecomment-}"
+  start=$(awk -F': ' '/^in-flight start:/{print $2; exit}' <<<"$body")
+  hours=$(awk -F': ' '/^hours reported:/{print $2; exit}' <<<"$body")
+  [ -z "$hours" ] && hours=0
+  printf '%s\t%s\t%s\n' "$cid" "$start" "$hours"
+}
+
+# Renders the marker comment body: the marker line plus two human-readable
+# lines an operator can read directly on the issue.
+flight_comment_body() {
+  printf '%s\nin-flight start: %s\nhours reported: %s\n' "$FLIGHT_MARKER" "$1" "$2"
+}
+
+# Creates the marker comment and prints the new comment's numeric id.
+create_flight_comment() {
+  local num="$1" body="$2" url
+  url=$(gh issue comment "$num" --body "$body" 2>/dev/null)
+  printf '%s' "${url##*#issuecomment-}"
+}
+
+# Rewrites the marker comment in place. Called only on an hour boundary or a
+# clock reset, never every cycle, and never posts a second comment.
+update_flight_comment() {
+  gh api --method PATCH "repos/{owner}/{repo}/issues/comments/$1" -f "body=$2" >/dev/null 2>&1
+}
+
+# Looks up an in-flight issue's title from this cycle's $inflight_data.
+title_for() {
+  awk -F'\t' -v n="$1" '$1==n{print $2; exit}' <<<"$inflight_data"
+}
+
 # Closes tabs belonging to finished issues. This is a backstop, not the normal
 # path: next-issue now closes its own tab on `done`. It exists for a session
 # that dies, is killed, or exits before it gets there and leaves its tab behind.
@@ -287,7 +364,8 @@ prev_inflight=""
 first_cycle=1
 
 while true; do
-  inflight=$(gh issue list --state open --label mgr:in-flight --json number --jq '.[].number' 2>/dev/null | sort -n)
+  inflight_data=$(gh issue list --state open --label mgr:in-flight --json number,title --jq '.[] | "\(.number)\t\(.title)"' 2>/dev/null)
+  inflight=$(cut -f1 <<<"$inflight_data" 2>/dev/null | sort -n)
   count=0
   [ -n "$inflight" ] && count=$(wc -l <<<"$inflight" | tr -d ' ')
   free=$(( CONCURRENCY - count ))
@@ -320,6 +398,59 @@ while true; do
   # just-closed issue usually still has its worktree while the session tears
   # down, so it gets swept on a later pass.
   sweep_finished_tabs
+
+  # Long-running-issue notices: once per whole hour an issue has been
+  # in-flight, never more than once for the same hour — even across watcher
+  # restarts, since the clock is read back from each issue's marker comment
+  # rather than kept locally.
+  #
+  # `gh issue list --json comments` returns only a comment COUNT, not
+  # bodies, so reading the marker back costs one extra `gh issue view` call
+  # per in-flight issue per cycle (plus one timeline call — see
+  # fetch_start_iso). Accepted deliberately: GitHub, not a local file, is
+  # the source of truth for this state.
+  now_epoch=$(date -u +%s)
+  while read -r num; do
+    [ -z "$num" ] && continue
+
+    row=$(age_comment_for "$num")
+    comment_id="" start_iso="" hours_reported=0
+    if [ -n "$row" ]; then
+      IFS=$'\t' read -r comment_id start_iso hours_reported <<<"$row"
+    fi
+
+    # The mgr:in-flight timeline is the source of truth for when the CURRENT
+    # flight period began. A marker comment surviving from an earlier period
+    # (the issue left flight and was later re-claimed) would otherwise
+    # report a bogus multi-day duration, so a labeling event newer than our
+    # recorded start resets the clock.
+    latest_iso=$(fetch_start_iso "$num")
+    need_write=0
+    [ -z "$comment_id" ] && need_write=1
+    if [ -z "$start_iso" ] || [ "$latest_iso" \> "$start_iso" ]; then
+      start_iso="$latest_iso"
+      hours_reported=0
+      need_write=1
+    fi
+
+    start_epoch=$(iso_to_epoch "$start_iso") || start_epoch=$now_epoch
+    elapsed_hours=$(( (now_epoch - start_epoch) / 3600 ))
+    if [ "$elapsed_hours" -gt "$hours_reported" ]; then
+      title=$(title_for "$num")
+      log "issue #$num has been in flight for ${elapsed_hours}h: $title"
+      report "issue #$num has been in flight for ${elapsed_hours}h: $title."
+      hours_reported=$elapsed_hours
+      need_write=1
+    fi
+
+    if [ "$need_write" -eq 1 ]; then
+      if [ -n "$comment_id" ]; then
+        update_flight_comment "$comment_id" "$(flight_comment_body "$start_iso" "$hours_reported")"
+      else
+        create_flight_comment "$num" "$(flight_comment_body "$start_iso" "$hours_reported")" >/dev/null
+      fi
+    fi
+  done <<<"$inflight"
 
   ready_list=$(ready_issues)
   ready_n=0
