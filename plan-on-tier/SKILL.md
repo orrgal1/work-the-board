@@ -1,6 +1,6 @@
 ---
 name: plan-on-tier
-description: "Launch a dedicated plan agent on an operator-chosen tier (1-3), same model provider as the current session, and keep it open for iterative plan review until the operator is satisfied. Use for 'tier 1/2/3 plan' requests."
+description: "Launch a dedicated plan subagent at an operator-chosen tier (1-3) and keep it open for iterative plan review until the operator is satisfied. Use for 'tier 1/2/3 plan' requests."
 ---
 
 # Plan On Tier

@@ -2,7 +2,6 @@
 name: plan-tier2
 description: Plans a request at tier 2 (mid-strength model role). Read-only; writes no code.
 model: "@tier2"
-thinkingLevel: high
 spawns: ""
 tools: "read, grep, glob, bash"
 ---

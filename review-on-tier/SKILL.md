@@ -1,6 +1,6 @@
 ---
 name: review-on-tier
-description: "Launch a dedicated code review agent on an operator-chosen tier (1-3), same model provider as the current session, and keep it open for iterative review discussion until the operator is satisfied. Use for 'tier 1/2/3 review' requests."
+description: "Launch a dedicated code review subagent at an operator-chosen tier (1-3) and keep it open for iterative review discussion until the operator is satisfied. Use for 'tier 1/2/3 review' requests."
 ---
 
 # Review On Tier
