@@ -145,7 +145,7 @@ A project board's items are dispatched into their own mapped repo's `path` and `
 grep -n '"attribution":"user"' <session>.jsonl   # what the operator actually typed, and when
 ```
 
-**Tab lifecycle.** On `done` the session removes its own worktree, then closes its own tab. The watcher's sweep is only a backstop for a session that dies, is killed, or exits before teardown: it closes a `<board>/issue-<N>:` tab once that issue is CLOSED and its worktree is gone, every cycle. More working tabs than `mgr:in-flight` issues is normal, not a leak — a session outlives its claim (it drops the label and closes the issue on landing, then may keep working, e.g. a post-land review, until it exits). Tabs opened before this change carry the old `issue-<N>:` label and no longer match the sweep — do one manual `herdr tab rename`/close pass on any still open.
+**Tab lifecycle.** On `done` the session removes its own worktree, then closes its own tab. The watcher's sweep is only a backstop for a session that dies, is killed, or exits before teardown: it closes a `<board>/issue-<N>:` tab once that issue is CLOSED and its worktree is gone, every cycle. More working tabs than `mgr:in-flight` issues is normal, not a leak — a session outlives its claim (it drops the label and closes the issue on landing, then may keep working, e.g. a post-land review, until it exits). Tabs opened before this change carry the old `issue-<N>:` label and no longer match the sweep — do one manual `herdr tab rename`/close pass on any still open. This sweep and self-teardown both cover issue tabs only — an `op:` tab is neither swept nor self-closing; see Op-tab teardown in step 6, which is this session's own job.
 
 ## 5. Verify one cycle
 
@@ -207,6 +207,29 @@ Name it so it can't collide with an issue agent (`<board>-issue-<N>`) — e.g.
 own loop. Relay whatever the operation session reports back to the operator when it
 arrives.
 
+**Op-tab teardown.** This session owns closing the op tab — nothing else ever will, since
+the watcher's sweep only matches `<board>/issue-<N>:` and an `op:` label can never satisfy
+that. Note `<name>`/`<TAB_ID>`/`<PANE_ID>` together at launch so an op still open can be
+found again later (`herdr tab list` / `herdr agent list`, filtered by the
+`<board>-op-<slug>` name from above).
+
+After relaying a report, check `herdr pane get <PANE_ID>`:
+
+| `agent_status` | Meaning | Action |
+|---|---|---|
+| `idle` or `done` | Operation finished | `herdr tab close <TAB_ID>` now |
+| `working` | Still running; this report may be interim | Leave the tab open; re-check on this session's next wake |
+| `blocked` | Waiting on the operator for an answer | Leave the tab open; relay what it needs and re-check after the operator responds |
+| `unknown`, no session file | Op agent died or never came up | Orphaned — close it, and say so once |
+
+A report is routinely sent from inside the op agent's own turn, so `agent_status` can still
+read `working` the instant after you relay it — that is not proof the operation is done.
+Re-check every op tab this rule left open on the next report, the next operator turn, and
+unconditionally at Stop (below); close it the first time its status reads `idle`/`done` —
+or orphaned, per the table above.
+Never close a tab that reads `working` or `blocked` — `blocked` means the operator hasn't
+answered it yet, not that the operation is finished.
+
 ## 7. Stop
 
-Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so a tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`.
+Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so an issue tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`. Any `op:` tab still open at this point is this session's own to close (see Op-tab teardown in step 6): close it now unless `herdr pane get <PANE_ID>` still reads `working` or `blocked` — name any tab left open for that reason as still running in the stop report so the operator knows it's theirs to steer or close from here.
