@@ -8,9 +8,12 @@
 #
 #   mode: supervised (default) — sessions stop after pushing; the operator
 #         instructs ready/land/done per issue, in that issue's own tab.
-#         auto — sessions plan (tier 2, if complex), implement, run a mandatory
-#         tier 2 review, then land and finish on their own. mgr:manual-approve
-#         still gates the merge.
+#         auto — sessions plan (tier 2, if complex; tier 3 for mission-critical
+#         or high-risk work such as auth/permissions, money, data loss or
+#         irreversible operations, schema/migrations, or the board's own
+#         control plane), implement, then run a mandatory review at the plan
+#         tier for rounds 1-2, escalating to tier 3 from round 3 on, before
+#         landing. mgr:manual-approve still gates the merge.
 #
 #   --project <owner>/<number>: project mode, for multiple independent boards
 #         over one repo or one board spanning repos. The named GitHub
@@ -1303,9 +1306,9 @@ launch_issue() {
   # Mode decides how far a session may take the issue on its own.
   if [ "$CUR_MODE" = "auto" ]; then
     instructions="Autonomous mode is in force. This prompt IS the explicit instruction that next-issue steps 5 to 7 require - do not wait for further approval, and do not ask the operator for routine decisions. In order:
-1. If this issue is complex - size:large, cross-cutting, a schema or contract change, or the approach is genuinely unsettled - first run a TIER 2 PLAN per the plan-on-tier skill, then follow it. Skip this for small settled work.
+1. If this issue is complex - size:large, cross-cutting, a schema or contract change, or the approach is genuinely unsettled - first run a PLAN per the plan-on-tier skill, then follow it: TIER 2 for a standard plan, TIER 3 when the issue is mission-critical or high-risk - auth and permissions, money, data loss or irreversible operations, schema and migrations, or the board's own control plane. Skip this for small settled work.
 2. Implement, and verify proportionately: only what your change touches, no full-project test suite and no repo-wide formatters.
-3. Before landing, run a TIER 2 REVIEW per the review-on-tier skill against your finished diff. This is mandatory on every issue. Fix every real finding, re-review if you changed anything material, and state in your report what it raised and what you did about each item.
+3. Before landing, run a REVIEW per the review-on-tier skill against your finished diff. This is mandatory on every issue. Run rounds 1 and 2 at this issue's plan tier (TIER 2 if no plan was run), escalating to TIER 3 for round 3 and any further round; round 3 is a new tier-3 subagent with no memory of the earlier rounds, so hand it the prior rounds' findings and what you changed in response before it reviews. Fix every real finding, re-review if you changed anything material, and state in your report what it raised and what you did about each item.
 4. If the issue carries mgr:manual-approve, mark the PR ready and stop there - do NOT merge it. Otherwise land it yourself: mark the PR ready, merge it squashed, $UNCLAIM_PHRASE.
 5. Then stop, completely. Remove your worktree, post your final report (noting explicitly if the PR is waiting on mgr:manual-approve rather than landed), and end your turn. Landing it, or leaving it ready for approval, is the finish line: do NOT review the landed commit, do NOT deploy or redeploy anything, do NOT update docs or changelogs, do NOT read AGENTS.md looking for follow-up chores, and do NOT pick up another issue. If you believe something genuinely remains, say so in your report and stop anyway - the board decides what happens next, not you."
   else
@@ -1627,7 +1630,7 @@ done
 # ONE consolidated startup report listing every board — N per-board
 # messages would wake the operator session N times to say the same thing.
 report_raw "started: $NBOARDS board(s), polling every ${POLL_SECONDS}s.$BOARDS_SUMMARY
-Supervised boards stop after pushing - you instruct ready/land/done in each issue tab. Auto boards plan, implement, run a mandatory tier 2 review, then land on their own; mgr:manual-approve still gates those merges. Launches, departures, hourly age notices and failures are reported here per board."
+Supervised boards stop after pushing - you instruct ready/land/done in each issue tab. Auto boards plan (tier 2, tier 3 for high-risk work), implement, run a mandatory review at the plan tier for rounds 1-2 escalating to tier 3 from round 3, then land on their own; mgr:manual-approve still gates those merges. Launches, departures, hourly age notices and failures are reported here per board."
 
 # The operator's total load, as one visible number: concurrency summed across
 # the config, and the steady-state gh request rate (repo mode: in-flight +
