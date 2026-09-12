@@ -180,8 +180,9 @@ skip_once() {
 # equivalent one-board config. Parsed and validated in ONE jq pass that
 # emits TSV rows: ERR (validation failure), CFG (globals), BOARD (one per
 # board, in file order), RCHECK (one per repo/path pair to verify against
-# the filesystem). Any ERR row aborts with exit 2 before the first cycle —
-# a bad path discovered lazily is a silently parked board.
+# the filesystem), WSCHECK (one per board/workspace pair to verify against
+# herdr's live workspace list). Any ERR row aborts with exit 2 before the
+# first cycle — a bad path discovered lazily is a silently parked board.
 # ---------------------------------------------------------------------------
 CONFIG_VALIDATE='
 def istr: type == "string";
@@ -252,7 +253,12 @@ def berrs($i):
          end) | @tsv),
     ($cfg.boards[] | .name as $b
       | (if .kind == "repo" then {repo: .repo, path: .path} else (.repos[] | {repo: .repo, path: .path}) end)
-      | ["RCHECK", $b, .repo, .path] | @tsv)
+      | ["RCHECK", $b, .repo, .path] | @tsv),
+    ($cfg.boards[] | .name as $b
+      | (if .kind == "repo" then [{field: "workspace", ws: .workspace}]
+         else [ .repos | to_entries[] | {field: "repos[\(.key)].workspace", ws: .value.workspace} ]
+         end)[]
+      | ["WSCHECK", $b, .field, .ws] | @tsv)
   end
 '
 
@@ -354,6 +360,26 @@ while IFS=$'\t' read -r _tag b r p; do
   o_owner="${o_owner##*:}"
   if [ "$o_owner/$o_repo" != "$r" ]; then
     echo "watch.sh: config: board $b: repo: $r does not match the origin remote of $p ($origin_url)" >&2
+    exit 2
+  fi
+done <<<"$rows"
+
+# Workspace-existence validation, still before the first cycle: every board's
+# workspace must be a live herdr workspace. A stale one would otherwise pass
+# here and then die forever in launch_issue's `herdr tab create --workspace`
+# with workspace_not_found, releasing the claim and repeating every cycle.
+ws_list_out=$(herdr workspace list 2>/dev/null)
+ws_list_rc=$?
+if [ "$ws_list_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$ws_list_out"; then
+  ws_list_err=$(herdr workspace list 2>&1 >/dev/null)
+  echo "watch.sh: cannot list herdr workspaces: ${ws_list_err:-$ws_list_out}" >&2
+  exit 2
+fi
+live_ws=$(jq -r '.result.workspaces[]?.workspace_id? // empty' <<<"$ws_list_out")
+while IFS=$'\t' read -r _tag b field ws; do
+  [ "$_tag" = "WSCHECK" ] || continue
+  if ! grep -qxF -- "$ws" <<<"$live_ws"; then
+    echo "watch.sh: config: board $b: $field: does not exist: $ws" >&2
     exit 2
   fi
 done <<<"$rows"

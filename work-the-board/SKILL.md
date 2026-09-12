@@ -92,7 +92,7 @@ Use one watcher process for several boards when: independent boards run over one
 
 `poll_seconds` (optional, default 30) and `report_agent` (optional) are watcher-wide. Each board needs a unique `name` matching `^[a-z0-9-]+$` (it labels that board's tabs and agents), a `kind` (`repo` or `project`), and `concurrency` — required, never defaulted, per board. `mode` defaults `supervised`. A `repo` board additionally needs `repo` (`owner/repo`), `path`, `workspace`. A `project` board needs `owner`, `number`, and a non-empty `repos` array of `{repo, path, workspace}` — one entry per repo the board spans.
 
-Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
+Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, a `workspace` that isn't a live herdr workspace, or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
 
 ## 4. Start the watcher
 
