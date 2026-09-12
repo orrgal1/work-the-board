@@ -59,6 +59,29 @@ of `main`, same as before — only the mechanism changed, not the branch-selecti
 git -C <primary checkout path> worktree add <new checkout path> <existing-branch>
 ```
 
+Immediately after either command above, verify the new worktree actually belongs to
+this repo before doing anything else with it — worktree-creation tooling has misplaced
+a worktree under an entirely different repo's tree before, and blindly trusting the
+result is exactly the failure mode to avoid:
+
+```bash
+git -C <new checkout path> remote get-url origin
+```
+
+Confirm that URL matches this repo's own remote, and that `<new checkout path>` sits
+under this repo's own worktree root, not some other project's. On any mismatch, the
+worktree belongs to the wrong repo: remove it (`git -C <primary checkout path> worktree
+remove <new checkout path>`), re-create it, and report the misplacement — never
+proceed with it, and never commit, push, or file anything against it.
+
+**Never repair a misplaced worktree by rewriting its remote.** `git remote set-url`,
+`git remote add`, and similar are NEVER valid repairs here, because a worktree shares
+its parent repository's `.git/config` — "fixing" the origin on a misplaced worktree
+actually rewrites the *primary* checkout's origin instead, and a following fetch can
+pull a foreign repo's refs into it (this has happened: it moved a primary checkout's
+`origin/main` to a different project's history entirely). The only valid repair is
+remove and re-create.
+
 Before touching any tab, decide which of the two cases below applies — that decision is
 conceptually the first thing to do, ahead of any tab action, though the `git worktree add`
 commands above are location-independent and may already have run regardless of which case
