@@ -19,8 +19,8 @@ Mode is `supervised` unless the operator asks for autonomy ("auto mode", "land t
 |---|---|---|
 | Session stops | after pushing, with a report | only when the issue is landed and done |
 | Landing | operator types `ready`/`land`/`done` in that issue's tab | the session does it itself |
-| Tier 2 plan | not requested | required first when the issue is complex |
-| Tier 2 review | not requested | mandatory on every issue, before landing |
+| Plan | not requested | required first when the issue is complex — tier 2 standard, tier 3 for mission-critical/high-risk work (auth/permissions, money, data loss or irreversible operations, schema/migrations, the board's own control plane) |
+| Review | not requested | mandatory on every issue, before landing — at the plan tier for rounds 1-2 (tier 2 if no plan ran), tier 3 from round 3 on |
 
 In auto mode the handout prompt states that it *is* the explicit instruction `next-issue` steps 5–7 require, so sessions don't stall waiting for approval that isn't coming.
 
