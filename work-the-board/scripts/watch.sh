@@ -2200,7 +2200,7 @@ service_board_cycle() {
         if ! agent_busy "$CUR_IDX" "$nwo#$num"; then
           agent_busy_mark "$CUR_IDX" "$nwo#$num"
           log "issue #$num: agent $agent_name is already live; skipping without claiming"
-          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue; on a multi-repo project board it can instead be another repo's issue #$num sharing the same board+number. The watcher will not free this on its own while the issue stays open: run herdr agent rename $agent_name --clear to free the name without disturbing that session, or close its tab if it is genuinely finished, then this issue will launch on a later cycle."
+          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue: no action needed, it self-heals and this issue launches automatically once that session exits and frees the name. If that session has already finished, close its tab to free the name now. On a multi-repo project board the name can instead belong to a different repo's issue #$num sharing the same board+number - free it without disturbing that other session via herdr agent rename $agent_name --clear."
         else
           log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
         fi
@@ -2344,16 +2344,33 @@ fi
 
 while true; do
   # Cross-board dedupe union for THIS cycle: every board's last-observed
-  # in-flight "<nwo>#<num>" keys. Each board refreshes its own contribution
-  # when its fresh fetch lands, and claims append immediately (see the
-  # launch loop) — the only cross-board coupling in the watcher, read-only
-  # apart from those insertions.
+  # in-flight "<nwo>#<num>" keys, PLUS every board's own currently-latched
+  # AGENTBUSY keys (review #20 round 3 MJ5). PREV_INFLIGHT alone is not
+  # enough for a live-agent-blocked issue: it is by definition NOT in
+  # flight (its prior session already dropped mgr:in-flight on landing),
+  # so without this the within-cycle CYCLE_SEEN append the launch loop's
+  # skip branch does (see there) protects only sibling boards serviced
+  # AFTER the owning board in THIS cycle, and evaporates at the very next
+  # cycle's reset below — a sibling board serviced first, or serviced on
+  # any later cycle, would see the issue as unclaimed and launch a SECOND
+  # concurrent session beside the still-live one. AGENTBUSY's lines are
+  # already exact "<nwo>#<num>" CYCLE_SEEN keys, so folding them in here
+  # closes that gap for every cycle where the owning board has latched
+  # the issue at least once; only a genuine one-poll race (sibling claims
+  # before the owning board has ever seen the issue ready) remains, the
+  # same class as the pre-existing cross-board claim race board_claim
+  # already arbitrates. Each board refreshes its own contribution when
+  # its fresh fetch lands, and claims append immediately (see the launch
+  # loop) — the only cross-board coupling in the watcher, read-only apart
+  # from those insertions.
   CYCLE_SEEN=""
   CYCLE_WS_SKIP=""
   CYCLE_WS_OK=""
   b=0
   while [ "$b" -lt "$NBOARDS" ]; do
     bv "$b" PREV_INFLIGHT
+    [ -n "$bvv" ] && CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$bvv")
+    bv "$b" AGENTBUSY
     [ -n "$bvv" ] && CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$bvv")
     b=$((b + 1))
   done
