@@ -255,10 +255,10 @@ def berrs($i):
       | (if .kind == "repo" then {repo: .repo, path: .path} else (.repos[] | {repo: .repo, path: .path}) end)
       | ["RCHECK", $b, .repo, .path] | @tsv),
     ($cfg.boards[] | .name as $b
-      | (if .kind == "repo" then [{field: "workspace", ws: .workspace}]
-         else [ .repos | to_entries[] | {field: "repos[\(.key)].workspace", ws: .value.workspace} ]
+      | (if .kind == "repo" then [{field: "workspace", ws: .workspace, path: .path}]
+         else [ .repos | to_entries[] | {field: "repos[\(.key)].workspace", ws: .value.workspace, path: .value.path} ]
          end)[]
-      | ["WSCHECK", $b, .field, .ws] | @tsv)
+      | ["WSCHECK", $b, .field, .ws, .path] | @tsv)
   end
 '
 
@@ -364,10 +364,21 @@ while IFS=$'\t' read -r _tag b r p; do
   fi
 done <<<"$rows"
 
-# Workspace-existence validation, still before the first cycle: every board's
-# workspace must be a live herdr workspace. A stale one would otherwise pass
-# here and then die forever in launch_issue's `herdr tab create --workspace`
-# with workspace_not_found, releasing the claim and repeating every cycle.
+# Workspace validation, still before the first cycle: every board's
+# workspace must be a live herdr workspace, AND it must be that board's own
+# repo's PRIMARY workspace — not merely any workspace that happens to
+# exist. A stale id would otherwise pass a bare existence check and then die
+# forever in launch_issue's `herdr tab create --workspace` with
+# workspace_not_found, releasing the claim and repeating every cycle; a live
+# but WRONG id (e.g. the board-watcher session's own workspace, or some other
+# repo's workspace, pasted in by mistake) would instead pass silently and
+# land every issue's tab somewhere that is not this repo's own nesting home
+# — exactly the gap this repo owns closing (nothing previously tied
+# `workspace` to `path`). A workspace counts as the repo's own primary
+# workspace only when herdr reports its `worktree.checkout_path` equal to
+# the board's configured `path` AND `worktree.is_linked_worktree` false; a
+# workspace with no `worktree` field at all, a mismatched checkout_path, or
+# one that is itself a linked (git-worktree-backed) workspace all fail.
 ws_list_out=$(herdr workspace list 2>/dev/null)
 ws_list_rc=$?
 if [ "$ws_list_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$ws_list_out"; then
@@ -376,10 +387,17 @@ if [ "$ws_list_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$ws_list_out"; then
   exit 2
 fi
 live_ws=$(jq -r '.result.workspaces[]?.workspace_id? // empty' <<<"$ws_list_out")
-while IFS=$'\t' read -r _tag b field ws; do
+while IFS=$'\t' read -r _tag b field ws path; do
   [ "$_tag" = "WSCHECK" ] || continue
   if ! grep -qxF -- "$ws" <<<"$live_ws"; then
     echo "watch.sh: config: board $b: $field: does not exist: $ws" >&2
+    exit 2
+  fi
+  ws_entry=$(jq -c --arg id "$ws" '.result.workspaces[]? | select(.workspace_id == $id) // empty' <<<"$ws_list_out")
+  ws_checkout=$(jq -r '(.worktree // {}) | .checkout_path // empty' <<<"$ws_entry")
+  ws_linked=$(jq -r '(.worktree // {}) | if has("is_linked_worktree") then (.is_linked_worktree | tostring) else "" end' <<<"$ws_entry")
+  if [ "$ws_checkout" != "$path" ] || [ "$ws_linked" != "false" ]; then
+    echo "watch.sh: config: board $b: $field: workspace $ws is not this repo's own primary workspace for path $path (need worktree.checkout_path == path and worktree.is_linked_worktree == false; found checkout_path=${ws_checkout:-<none>}, is_linked_worktree=${ws_linked:-<none>}) — open $path as its own herdr workspace (not a git-worktree-linked one) and point $field at that workspace's id" >&2
     exit 2
   fi
 done <<<"$rows"
@@ -926,8 +944,11 @@ title_for() { # <nwo> <num>
 # has it CLOSED, and no mapped checkout still holds an issue-<n> worktree.
 #
 # NOTE: tabs created before this naming change (bare "issue-<n>: <title>")
-# no longer match the pattern and are never swept; close leftovers from a
-# pre-upgrade watcher once by hand.
+# no longer match this board-scoped pattern — but they are not stranded:
+# they live inside the old per-worktree-workspace mechanism's linked-worktree
+# workspaces, and sweep_orphan_worktrees (below) reaps that whole workspace,
+# tabs included, automatically once its issue number leaves flight
+# everywhere. Nothing here needs to close them by hand anymore.
 sweep_finished_tabs() {
   local tabs tab bname num r p state any_closed keep
 
@@ -968,6 +989,113 @@ sweep_finished_tabs() {
       report "closed issue #$num's finished tab ($tab): landed, worktree gone, session done."
     fi
   done <<<"$tabs"
+}
+
+# Memoizes `git -C <path> rev-parse --show-toplevel` per checkout path across
+# every call this process makes (cache lives in ORPHAN_ROOT_CACHE, "<path>\t
+# <root>" lines) — RCHECK already proved each mapped path is a git checkout
+# at startup and the config cannot change without a restart, so one lookup
+# per path for the whole run is enough. rc 1 if the path is not resolvable.
+ORPHAN_ROOT_CACHE=""
+repo_root_for() { # <path>
+  local p="$1" hit root
+  hit=$(awk -F'\t' -v p="$p" '$1==p{print $2; exit}' <<<"$ORPHAN_ROOT_CACHE")
+  if [ -n "$hit" ]; then printf '%s\n' "$hit"; return 0; fi
+  root=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$root" ] || return 1
+  ORPHAN_ROOT_CACHE=$(printf '%s\n%s\t%s' "$ORPHAN_ROOT_CACHE" "$p" "$root")
+  printf '%s\n' "$root"
+}
+
+# Reaps stray herdr workspaces left over from the OLD (now-removed)
+# per-worktree-workspace mechanism — `next-issue`'s prior `herdr worktree
+# create` call always created a second, separate herdr workspace as a side
+# effect of making the checkout — or from a hand-run/other-tool `herdr
+# worktree create`. Runs once per board per cycle, right after
+# sweep_finished_tabs. Local herdr/git calls only, zero GitHub calls, so it
+# never touches this file's GitHub rate-limit accounting.
+#
+# A candidate is a live workspace with worktree.is_linked_worktree true
+# whose worktree.repo_root resolves to one of THIS board's mapped repos
+# (never another board's, and never a repo's own primary workspace, which
+# always has is_linked_worktree false). Its issue number comes from, in
+# order: its checkout_path's basename against ^issue-([0-9]+)([^0-9]|$), or
+# else any of its own tabs' labels against ^([a-z0-9-]+/)?issue-([0-9]+):.
+# No number found at all (a hand-made worktree, a deploy/preview checkout,
+# anything not issue-shaped) means the workspace is never touched. A number
+# found but still in flight (this board's $inflight or the cross-board
+# $CYCLE_SEEN), or a workspace holding any pane with a live "agent" key,
+# means skip too — a live session or another board still owns it.
+#
+# Everything else is reaped: `herdr worktree remove --workspace <id>` (NEVER
+# --force — a dirty checkout stays untouched rather than losing work), then
+# `herdr workspace close <id>` (its own not-found is tolerated: removal may
+# already have closed the workspace). A remove failure is reported exactly
+# once via skip_once's latch, not every cycle, and retried plainly (no
+# --force) on later cycles in case the checkout becomes clean.
+sweep_orphan_worktrees() {
+  local ws_out map r p _ws root candidates ws_id ws_checkout ws_root
+  local nwo base num key has_agent rm_out rm_rc
+
+  ws_out=$(herdr workspace list 2>/dev/null) || return 0
+  jq -e . >/dev/null 2>&1 <<<"$ws_out" || return 0
+
+  map=""
+  while IFS=$'\t' read -r r p _ws; do
+    [ -z "$r" ] && continue
+    root=$(repo_root_for "$p") || continue
+    map="$map
+$root	$r"
+  done <<<"$CUR_REPOMAP"
+  [ -z "$map" ] && return 0
+
+  candidates=$(jq -r '.result.workspaces[]?
+    | select((.worktree? // null) != null and (.worktree.is_linked_worktree? // false) == true)
+    | [.workspace_id, (.worktree.checkout_path // ""), (.worktree.repo_root // "")] | @tsv' <<<"$ws_out")
+  [ -z "$candidates" ] && return 0
+
+  while IFS=$'\t' read -r ws_id ws_checkout ws_root; do
+    [ -z "$ws_id" ] && continue
+    nwo=$(awk -F'\t' -v r="$ws_root" '$1==r{print $2; exit}' <<<"$map")
+    [ -z "$nwo" ] && continue
+
+    base=$(basename -- "$ws_checkout")
+    num=""
+    if [[ "$base" =~ ^issue-([0-9]+)([^0-9]|$) ]]; then
+      num="${BASH_REMATCH[1]}"
+    fi
+    if [ -z "$num" ]; then
+      num=$(herdr tab list 2>/dev/null \
+            | jq -r --arg ws "$ws_id" '
+                .result.tabs[]?
+                | select(.workspace_id == $ws)
+                | select(.label? // "" | test("^([a-z0-9-]+/)?issue-[0-9]+:"))
+                | (.label | capture("^([a-z0-9-]+/)?issue-(?<n>[0-9]+):")).n' \
+            | head -1)
+    fi
+    [ -z "$num" ] && continue
+
+    key="$nwo#$num"
+    grep -qxF "$key" <<<"$inflight" && continue
+    grep -qxF "$key" <<<"$CYCLE_SEEN" && continue
+
+    has_agent=$(herdr pane list --workspace "$ws_id" 2>/dev/null \
+                | jq -r '[.result.panes[]? | select(has("agent"))] | length' 2>/dev/null)
+    [ "${has_agent:-0}" -gt 0 ] 2>/dev/null && continue
+
+    rm_out=$(herdr worktree remove --workspace "$ws_id" 2>&1)
+    rm_rc=$?
+    if [ "$rm_rc" -ne 0 ]; then
+      if skip_once "orphan-remove-failed:$ws_id"; then
+        log "orphan workspace $ws_id (issue #$num, $nwo): worktree remove failed: $rm_out"
+        report "found orphan workspace $ws_id for issue #$num ($nwo) but could not remove its worktree (left untouched, no --force): $rm_out"
+      fi
+      continue
+    fi
+    herdr workspace close "$ws_id" >/dev/null 2>&1 || true
+    log "orphan workspace $ws_id (issue #$num, $nwo): reaped stray per-worktree workspace"
+    report "reaped orphan workspace $ws_id: stray per-worktree workspace for issue #$num ($nwo), no live agent, issue not in flight."
+  done <<<"$candidates"
 }
 
 # Prints "<pr_number><TAB><head_branch>" if an open PR already belongs to this
@@ -1224,6 +1352,13 @@ service_board_cycle() {
   # just-closed issue usually still has its worktree while the session tears
   # down, so it gets swept on a later pass.
   sweep_finished_tabs
+
+  # Reap stray per-worktree herdr workspaces from the old (now-removed)
+  # per-issue-workspace mechanism, or from a stray hand/tool `herdr worktree
+  # create` — see sweep_orphan_worktrees for the exact reap predicate. Local
+  # herdr/git calls only; no GitHub calls, so it never affects the rate
+  # limit accounting below.
+  sweep_orphan_worktrees
 
   # Long-running-issue notices: once per whole hour an issue has been
   # in-flight, never more than once for the same hour - even across watcher
