@@ -474,10 +474,9 @@ ws_worktree_fields() { # <ws_list_json> <ws_id>
 # checkout_path resolving to the same git toplevel via repo_root_for, and
 # is_linked_worktree false). rc 0 with the id printed means a match; rc 1
 # means no such workspace exists (safe to create one); rc 2 means it could
-# NOT be determined (repo_root_for failed, herdr workspace list failed, or
-# its output was not valid JSON) - callers MUST treat rc 2 as "do not know",
-# never as "none exists", or a transient herdr hiccup forks a second
-# workspace onto a checkout that may already have a live one (#14).
+# NOT be determined (repo_root_for failed on $path itself, herdr workspace
+# list failed, or its output was not valid JSON) - callers MUST treat rc 2
+# as "do not know", never as "none exists".
 #
 # Kept separate from WSCHECK on purpose: WSCHECK answers "is THIS configured
 # id right, and if not, exactly how is it wrong" (with its own transient
@@ -491,6 +490,17 @@ ws_worktree_fields() { # <ws_list_json> <ws_id>
 # own retry loop is untouched and stays the belt this does not duplicate; a
 # workspace whose worktree is transiently null here just isn't matched this
 # call, and the pre-claim gate calls this again next cycle anyway.
+#
+# A per-CANDIDATE repo_root_for failure (some OTHER live workspace's own
+# checkout no longer resolving - operator deleted or moved that clone) is
+# deliberately just skipped (#19 review round 4, MAJOR-1), not treated as
+# "could not determine": returning 2 there let one unrelated stale
+# workspace anywhere in `workspace list` disable recovery for every repo
+# on the board. Safe to fall through to "no match" for $path specifically:
+# ensure_repo_workspace's caller then tries `herdr worktree open`, which is
+# idempotent and ADOPTS (never forks) if a live workspace for $path really
+# exists (#19 review round 3, B2) - the fork risk this originally guarded
+# against no longer exists.
 resolve_primary_workspace() {   # <path>
   local out want id checkout linked root
   want=$(repo_root_for "$1") || return 2
@@ -499,7 +509,7 @@ resolve_primary_workspace() {   # <path>
   while IFS=$'\t' read -r id checkout linked; do
     [ -z "$id" ] && continue
     [ "$linked" = "false" ] || continue
-    root=$(repo_root_for "$checkout") || return 2
+    root=$(repo_root_for "$checkout") || continue
     [ "$root" = "$want" ] || continue
     printf '%s\n' "$id"
     return 0
@@ -1383,13 +1393,18 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   # exclusive ownership (the anchor rename, closing on a failed check)
   # must not run for this case: adopt it exactly like the
   # resolve_primary_workspace hit above, never touch or destroy it.
+  # Every consumer below tests "!= false", not "= true" (#19 review round
+  # 4, MINOR-1): herdr 0.9.0 always emits already_open explicitly, but if a
+  # future herdr ever dropped or renamed the field, absent/unparseable must
+  # fail toward "assume adopted, touch nothing" - the safe direction - not
+  # toward "assume freshly created, safe to rename/close".
   adopted=$(jq -r '.result.already_open // empty' <<<"$out" 2>/dev/null)
   # Defensive: a path that BECAME a linked git worktree after startup would
   # give us a linked-worktree workspace, which sweep_orphan_worktrees is
   # entitled to reap. Only an explicit true fails; an absent field is fine.
   linked=$(jq -r '.result.workspace.worktree.is_linked_worktree // empty' <<<"$out" 2>/dev/null)
   if [ "$linked" = "true" ]; then
-    if [ "$adopted" = "true" ]; then
+    if [ "$adopted" != "false" ]; then
       WS_ENSURE_ERR="$path is a linked git worktree, not a primary checkout: herdr returned already-open linked-worktree workspace $new for it - left it untouched, this call does not own it"
     else
       herdr workspace close "$new" >/dev/null 2>&1
@@ -1408,7 +1423,7 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   [ -n "$new_checkout" ] && new_root=$(repo_root_for "$new_checkout" 2>/dev/null)
   want_root=$(repo_root_for "$path" 2>/dev/null)
   if [ -z "$new_root" ] || [ -z "$want_root" ] || [ "$new_root" != "$want_root" ]; then
-    if [ "$adopted" = "true" ]; then
+    if [ "$adopted" != "false" ]; then
       WS_ENSURE_ERR="herdr worktree open --cwd $path returned already-open workspace $new but its worktree.checkout_path (${new_checkout:-<none>}) does not resolve to $path's own git toplevel - left it untouched, this call does not own it, not creating a new one"
     else
       herdr workspace close "$new" >/dev/null 2>&1
@@ -1416,7 +1431,7 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
     fi
     return 1
   fi
-  if [ "$adopted" = "true" ]; then
+  if [ "$adopted" != "false" ]; then
     # Converges with the resolve_primary_workspace hit above rather than
     # the fresh-create path below: herdr found the same live workspace the
     # resolver should have (a transient worktree:null read, a per-candidate
