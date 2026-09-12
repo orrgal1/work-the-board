@@ -805,9 +805,18 @@ iso_to_epoch() {
 # fails. Returns an ISO-8601 UTC timestamp, GitHub's own format.
 fetch_start_iso() { # <nwo> <num>
   local nwo="$1" num="$2" ts
-  ts=$(gh api "repos/$nwo/issues/$num/timeline" \
-        --jq '[.[] | select(.event=="labeled" and .label.name=="mgr:in-flight") | .created_at] | last' \
-        2>/dev/null)
+  # The timeline is oldest-first and capped at 30 events per page. Without
+  # --paginate, a timeline longer than one page hides the CURRENT flight
+  # period's labeling behind older history on page one, so `| last` picks
+  # the last match on page one - the oldest page - not the most recent
+  # labeling. `--paginate` walks every page, but `--jq` runs once per page
+  # rather than once over the concatenated result, so this prints one line
+  # per matching event across all pages; sort them and take the max instead
+  # of trusting document order. per_page=100 cuts the page count for long
+  # timelines rather than paging at the default 30/page.
+  ts=$(gh api --paginate -f per_page=100 "repos/$nwo/issues/$num/timeline" \
+        --jq '.[] | select(.event=="labeled" and .label.name=="mgr:in-flight") | .created_at' \
+        2>/dev/null | sort | tail -n1)
   if [ -n "$ts" ] && [ "$ts" != "null" ]; then
     printf '%s' "$ts"
   else
