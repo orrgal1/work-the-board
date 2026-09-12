@@ -9,7 +9,7 @@ workspace manager.
 |---|---|
 | `new-issue` | File one request as a deduped issue, placed in its dependency lane. |
 | `next-issue` | Own one issue end to end: worktree, draft PR, implement, land on command. |
-| `work-the-board` | Keep N issues in flight: poll, claim, hand each to a `next-issue` session. |
+| `work-the-board` | Keep N issues in flight: poll, claim, hand each to a `next-issue` session, and route anything else the operator sends the board tab instead of doing it there. |
 | `plan-on-tier` | Plan with a subagent pinned to an explicit provider/model tier (1-3). |
 | `review-on-tier` | Review with a subagent pinned to an explicit provider/model tier (1-3). |
 
