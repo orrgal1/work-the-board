@@ -86,12 +86,15 @@ label-matching failure this skill exists to avoid.
 
 **Rare fallback — your pane is NOT already inside the target repo's own workspace.**
 Check this first, before any tab action: compare `$HERDR_WORKSPACE_ID` against the
-repo's own primary workspace id, found with the same predicate `watch.sh`'s startup
-validation uses — the workspace whose `.worktree.checkout_path` equals the primary
-checkout path and whose `.worktree.is_linked_worktree` is `false`:
+repo's own primary workspace id, found with the same reasoning `watch.sh`'s startup
+validation uses — a workspace counts as the repo's own primary workspace when its
+checkout resolves to the repo's git root and it is not itself a linked worktree. The jq
+below does a plain string match, so resolve the canonical root first and substitute that
+(not a relative or symlinked path) for `<primary checkout path>`:
 
 ```bash
-herdr workspace list | jq -r '.result.workspaces[] | select(.worktree.checkout_path == "<primary checkout path>" and .worktree.is_linked_worktree == false) | .workspace_id'
+primary_root=$(git -C <primary checkout path> rev-parse --show-toplevel)
+herdr workspace list | jq -r --arg root "$primary_root" '.result.workspaces[] | select(.worktree.checkout_path == $root and .worktree.is_linked_worktree == false) | .workspace_id'
 ```
 
 If `$HERDR_WORKSPACE_ID` differs from that id, relocate your own running pane there
@@ -163,6 +166,7 @@ the issue without landing — in that case remove `mgr:in-flight` and leave the 
 with a comment explaining why, before proceeding):
 
 ```bash
+cd <primary checkout path>
 git -C <primary checkout path> worktree remove <checkout path>
 herdr tab close <TAB_ID>
 ```
@@ -175,6 +179,10 @@ list` and match the label prefix `issue-<N>:`. Never close the tab or remove the
 worktree before landing unless told to abandon the issue.
 
 Note: `git worktree remove` addresses the checkout by its recorded `<checkout path>`,
-not by the session's live cwd — even though step 4 keeps this session's cwd inside that
-same checkout the whole time, removing it does not pull the rug out from under the
-command doing the removing.
+not by the session's live cwd, so the command itself does not care where it is run
+from — but this session's own cwd has been inside that checkout since step 4, and once
+the removal succeeds that directory is gone. Anything run afterward from a shell still
+sitting in it — including the very next `herdr tab close` above — would fail or behave
+oddly against a now-deleted cwd. `cd <primary checkout path>` first, as shown above,
+before running `git worktree remove`, so nothing that follows executes from a deleted
+directory.
