@@ -1150,13 +1150,46 @@ sweep_finished_tabs() {
   done <<<"$tabs"
 }
 
-# Reaps stray herdr workspaces left over from the OLD (now-removed)
-# per-worktree-workspace mechanism — `next-issue`'s prior `herdr worktree
-# create` call always created a second, separate herdr workspace as a side
-# effect of making the checkout — or from a hand-run/other-tool `herdr
-# worktree create`. Runs once per board per cycle, right after
-# sweep_finished_tabs. Local herdr/git calls only, zero GitHub calls, so it
-# never touches this file's GitHub rate-limit accounting.
+# Returns success (0) if any line of <live_paths> (a TSV, one live agent per
+# line, "<cwd><TAB><foreground_cwd>", either field possibly empty) names a
+# cwd or foreground_cwd equal to <checkout_path>, or nested under it. This
+# is the cross-workspace liveness check sweep_orphan_worktrees relies on
+# (see #25): an agent's own pane lives in the repo's PRIMARY workspace, not
+# necessarily inside the candidate (stray, linked-worktree) workspace being
+# considered, so this must be checked against every live agent everywhere,
+# never scoped to panes of the candidate workspace itself.
+#
+# Prefix match uses bash parameter-expansion prefix removal
+# (${c#"$checkout"/}), not [[ == prefix* ]] glob matching, since a real
+# checkout path can contain glob metacharacters that would otherwise be
+# misinterpreted.
+agent_owns_checkout() { # <checkout_path> <live_paths>
+  local checkout="$1" paths="$2" c f
+  while IFS=$'\t' read -r c f; do
+    for c in "$c" "$f"; do
+      [ -z "$c" ] && continue
+      [ "$c" = "$checkout" ] && return 0
+      [ "${c#"$checkout"/}" != "$c" ] && return 0
+    done
+  done <<<"$paths"
+  return 1
+}
+
+# Reaps stray herdr WORKSPACE REGISTRATIONS left over from the OLD
+# (now-removed) per-worktree-workspace mechanism — `next-issue`'s prior
+# `herdr worktree create` call always created a second, separate herdr
+# workspace as a side effect of making the checkout — or from a hand-run/
+# other-tool `herdr worktree create`. Runs once per board per cycle, right
+# after sweep_finished_tabs. Local herdr/git calls only, zero GitHub calls,
+# so it never touches this file's GitHub rate-limit accounting.
+#
+# This function ONLY ever closes a herdr workspace registration — it never
+# deletes a git checkout. #14's original complaint was workspace-list
+# clutter from these stray registrations, not on-disk checkouts; deleting a
+# working tree is far more destructive than that clutter, so the two must
+# never be coupled again (see #25, where this sweep's old `herdr worktree
+# remove` action deleted the on-disk checkout of a session actively working
+# from it).
 #
 # A candidate is a live workspace with worktree.is_linked_worktree true
 # whose worktree.repo_root resolves to one of THIS board's mapped repos
@@ -1165,33 +1198,45 @@ sweep_finished_tabs() {
 # order: its checkout_path's basename against ^issue-([0-9]+)([^0-9]|$), or
 # else any of its own tabs' labels against ^([a-z0-9-]+/)?issue-([0-9]+):.
 # No number found at all (a hand-made worktree, a deploy/preview checkout,
-# anything not issue-shaped) means the workspace is never touched. A number
-# found but still in flight (this board's $inflight or the cross-board
-# $CYCLE_SEEN) means skip too — another board or this one still owns it.
+# anything not issue-shaped) means the workspace is never touched.
 #
-# Local-only safety guard, no GitHub calls: an open, deliberately parked
-# issue (e.g. mgr:hold) can still have a real, clean, pushed checkout here —
-# in flight is not the same as wanted. A candidate is skipped, not reaped,
-# when its checkout has no upstream tracking branch (no upstream is itself a
-# signal this could be uncommitted-to-remote or user-created work) or has
-# any commit ahead of its upstream; the upstream/ahead-count check failing
-# for any reason is treated the same as "unpushed work exists" (fail
-# closed). A workspace holding any pane with a live "agent" key is also
-# skipped, and so is a workspace whose live-pane check itself could not be
-# confirmed (herdr/jq failure, or a non-numeric pane count) — an unknown
-# agent state must never be read as "no agent, safe to reap".
+# A number found but still in flight (this board's $inflight or the
+# cross-board $CYCLE_SEEN) is a fast-path skip — but it is never, by
+# itself, sufficient to prove a candidate reapable. mgr:hold and every
+# other non-in-flight label state is UNKNOWN ownership, not unowned: a
+# session can be actively working a held/parked issue from its checkout.
+# The real, always-run gate is the cross-workspace live-agent check below,
+# fetched ONCE via a single `herdr agent list` call before the per-candidate
+# loop (not per candidate) and reused as `live_paths` for every candidate:
+# a candidate is skipped whenever ANY live agent, in ANY workspace, has its
+# cwd or foreground_cwd inside the candidate's checkout (per
+# agent_owns_checkout above) — this is what actually protects a session
+# whose own pane lives in the repo's primary workspace while the stray
+# workspace under consideration sits elsewhere, the exact shape that broke
+# in the #25 incident. Fetching/parsing `herdr agent list` failing fails
+# the WHOLE sweep closed for this cycle (return 0 immediately), since
+# without that data no candidate can be proven unowned.
 #
-# Everything else is reaped: `herdr worktree remove --workspace <id>` (NEVER
-# --force — a dirty checkout stays untouched rather than losing work), then
-# `herdr workspace close <id>` (its own not-found is tolerated: removal may
-# already have closed the workspace). A remove failure, or any of the new
-# skip reasons above, is reported exactly once via skip_once's latch, not
-# every cycle, and retried plainly (no --force) on later cycles in case the
-# checkout becomes clean or gets pushed.
+# Local-only safety guard (M3), unrelated to the live-agent check: an open,
+# deliberately parked issue can still have a real, clean, pushed checkout
+# here. A candidate is skipped, not closed, when its checkout has no
+# upstream tracking branch (no upstream is itself a signal this could be
+# uncommitted-to-remote or user-created work) or has any commit ahead of
+# its upstream; the check failing for any reason is treated the same as
+# "unpushed work exists" (fail closed). This is now only a
+# visibility/decluttering signal, not a data-loss guard — the checkout is
+# never deleted by this function — but an unpushed/dirty checkout is still
+# worth leaving its workspace card visible for.
+#
+# Everything else is reaped: `herdr workspace close <id>` only. This
+# unregisters the stray workspace; the checkout stays on disk, untouched,
+# forever — this sweep must never delete a git checkout again. A close
+# failure, or any of the skip reasons above, is reported exactly once via
+# skip_once's latch, not every cycle, and retried plainly on later cycles.
 sweep_orphan_worktrees() {
   local ws_out map r p _ws root candidates ws_id ws_checkout ws_root
-  local nwo base num key has_agent rm_out rm_rc
-  local has_upstream ahead pane_out pane_rc
+  local nwo base num key close_out close_rc
+  local has_upstream ahead agent_out agent_rc agent_ok live_paths
 
   ws_out=$(herdr workspace list 2>/dev/null) || return 0
   jq -e . >/dev/null 2>&1 <<<"$ws_out" || return 0
@@ -1209,6 +1254,23 @@ $root	$r"
     | select((.worktree? // null) != null and (.worktree.is_linked_worktree? // false) == true)
     | [.workspace_id, (.worktree.checkout_path // ""), (.worktree.repo_root // "")] | @tsv' <<<"$ws_out")
   [ -z "$candidates" ] && return 0
+
+  # Cross-workspace live-agent snapshot (see doc comment above): fetched
+  # ONCE, reused for every candidate. Fail closed for the whole sweep, not
+  # per-candidate, if it cannot be trusted.
+  agent_out=$(herdr agent list 2>/dev/null)
+  agent_rc=$?
+  agent_ok=1
+  if [ "$agent_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$agent_out"; then
+    agent_ok=0
+  fi
+  if [ "$agent_ok" -ne 1 ]; then
+    if skip_once "orphan-agent-list-failed"; then
+      log "orphan sweep: herdr agent list failed or returned invalid JSON — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
+    fi
+    return 0
+  fi
+  live_paths=$(jq -r '.result.agents[]? | [(.cwd // ""), (.foreground_cwd // "")] | @tsv' <<<"$agent_out")
 
   while IFS=$'\t' read -r ws_id ws_checkout ws_root; do
     [ -z "$ws_id" ] && continue
@@ -1235,8 +1297,14 @@ $root	$r"
     grep -qxF "$key" <<<"$inflight" && continue
     grep -qxF "$key" <<<"$CYCLE_SEEN" && continue
 
-    # Local-only safety guard (M3): never reap a checkout with no upstream
-    # or with commits not yet pushed — fail closed on any uncertainty.
+    # Cross-workspace live-agent guard — the actual #25 fix. Never
+    # sufficient to skip based on in-flight/label state alone; this must
+    # run for every candidate that reaches here (see doc comment above).
+    agent_owns_checkout "$ws_checkout" "$live_paths" && continue
+
+    # Local-only safety guard (M3): never close a workspace whose checkout
+    # has no upstream or has commits not yet pushed — fail closed on any
+    # uncertainty. Visibility signal only now (see doc comment above).
     has_upstream=1
     git -C "$ws_checkout" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1 || has_upstream=0
     ahead=""
@@ -1245,45 +1313,23 @@ $root	$r"
     fi
     if [ "$has_upstream" -ne 1 ] || [ -z "$ahead" ] || [ "$ahead" != "0" ]; then
       if skip_once "orphan-unpushed:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): no upstream tracking branch, or unpushed commits ahead of upstream (or the check itself failed) — left untouched, not reaped"
-        report "found orphan workspace $ws_id for issue #$num ($nwo) but its checkout has no upstream or has commits not yet pushed (left untouched, not reaped)"
+        log "orphan workspace $ws_id (issue #$num, $nwo): no upstream tracking branch, or unpushed commits ahead of upstream (or the check itself failed) — left untouched, not closed"
+        report "found orphan workspace $ws_id for issue #$num ($nwo) but its checkout has no upstream or has commits not yet pushed (left untouched, not closed)"
       fi
       continue
     fi
 
-    # Live-agent guard (M4): fail closed. herdr/jq failure or a non-numeric
-    # pane count means "unknown", never "zero agents, safe to reap".
-    pane_out=$(herdr pane list --workspace "$ws_id" 2>/dev/null)
-    pane_rc=$?
-    if [ "$pane_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$pane_out"; then
-      if skip_once "orphan-pane-list-failed:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): herdr pane list failed or returned invalid JSON — left untouched, cannot confirm no live agent"
+    close_out=$(herdr workspace close "$ws_id" 2>&1)
+    close_rc=$?
+    if [ "$close_rc" -ne 0 ]; then
+      if skip_once "orphan-close-failed:$ws_id"; then
+        log "orphan workspace $ws_id (issue #$num, $nwo): workspace close failed: $close_out"
+        report "found orphan workspace $ws_id for issue #$num ($nwo) but could not close its workspace registration (left untouched): $close_out"
       fi
       continue
     fi
-    has_agent=$(jq -r '[.result.panes[]? | select(has("agent"))] | length' <<<"$pane_out" 2>/dev/null)
-    case "$has_agent" in
-      ''|*[!0-9]*)
-        if skip_once "orphan-pane-count-invalid:$ws_id"; then
-          log "orphan workspace $ws_id (issue #$num, $nwo): could not determine live-pane count (got '$has_agent') — left untouched"
-        fi
-        continue
-        ;;
-    esac
-    [ "$has_agent" -gt 0 ] && continue
-
-    rm_out=$(herdr worktree remove --workspace "$ws_id" 2>&1)
-    rm_rc=$?
-    if [ "$rm_rc" -ne 0 ]; then
-      if skip_once "orphan-remove-failed:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): worktree remove failed: $rm_out"
-        report "found orphan workspace $ws_id for issue #$num ($nwo) but could not remove its worktree (left untouched, no --force): $rm_out"
-      fi
-      continue
-    fi
-    herdr workspace close "$ws_id" >/dev/null 2>&1 || true
-    log "orphan workspace $ws_id (issue #$num, $nwo): reaped stray per-worktree workspace"
-    report "reaped orphan workspace $ws_id: stray per-worktree workspace for issue #$num ($nwo), no live agent, issue not in flight, checkout clean and pushed."
+    log "orphan workspace $ws_id (issue #$num, $nwo): closed stray per-worktree workspace registration (git checkout left on disk, untouched)"
+    report "closed orphan workspace $ws_id: stray per-worktree workspace registration for issue #$num ($nwo), no live agent, issue not in flight, checkout clean and pushed. Git checkout left on disk, untouched."
   done <<<"$candidates"
 }
 
