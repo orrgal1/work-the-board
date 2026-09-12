@@ -1215,6 +1215,13 @@ agent_owns_checkout() { # <checkout_path> <live_paths>
 # Deliberately NOT filtered by agent_status (n4): a `done`-status agent
 # still counts as live/owning here — over-inclusive is the safe direction,
 # and a future `working`-only filter would quietly narrow this guard.
+#
+# Deliberately board-agnostic (N3, #25 review round 2): matches ANY live
+# agent's name carrying this issue number, not just this board's own
+# "$CUR_NAME-issue-$num". Cross-board over-protection is the safe
+# direction — a same-numbered issue owned by a different board's session
+# is rare, but skipping it costs nothing, while narrowing to this board
+# only would reopen a gap for that rare case.
 agent_name_owns_issue() { # <num> <live_names>
   local num="$1" names="$2" n
   [ -z "$num" ] && return 1
@@ -1237,6 +1244,13 @@ agent_name_owns_issue() { # <num> <live_names>
 # own num-from-tab-label lookup and by sweep_finished_tabs.
 #
 # Deliberately NOT filtered by agent_status (n4) — see agent_name_owns_issue.
+#
+# Deliberately board-agnostic (N3, #25 review round 2), same rationale as
+# agent_name_owns_issue above. This also matters for real data: a
+# standalone (non-board) next-issue session's tab carries a bare
+# "issue-<n>:" label with no board prefix, which this pattern already
+# covers by design — narrowing it to a specific board would break that
+# shape, not just over-narrow the cross-board case.
 agent_tab_owns_issue() { # <num> <tab_ids> <tab_label_map>
   local num="$1" ids="$2" map="$3" t label
   [ -z "$num" ] && return 1
@@ -1387,6 +1401,12 @@ $root	$r"
 
   while IFS=$'\t' read -r ws_id ws_checkout ws_root; do
     [ -z "$ws_id" ] && continue
+    # N1 (#25 review round 2): herdr can report worktree data transiently
+    # (see :446-450's documented "worktree: null" retry precedent) — an
+    # empty checkout_path means there is no on-disk path to confirm
+    # anything about, so never make a close decision from it; wait for a
+    # later cycle where herdr reports it populated.
+    [ -z "$ws_checkout" ] && continue
     nwo=$(awk -F'\t' -v r="$ws_root" '$1==r{print $2; exit}' <<<"$map")
     [ -z "$nwo" ] && continue
 
@@ -1455,7 +1475,7 @@ $root	$r"
         ;;
     esac
     if [ "$has_agent" -gt 0 ]; then
-      if skip_once "orphan-live-agent:$ws_id"; then
+      if skip_once "orphan-live-agent-pane:$ws_id"; then
         log "orphan workspace $ws_id (issue #$num, $nwo): live agent found (pane inside the candidate workspace itself) — left untouched, not closed"
       fi
       continue
