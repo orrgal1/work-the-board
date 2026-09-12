@@ -220,6 +220,18 @@ ws_dead()       { local s; bv "$1" WSDEAD; s=$bvv; [ -n "$2" ] && grep -qxF "$2"
 ws_dead_mark()  { local s; bv "$1" WSDEAD; s=$bvv; ws_dead "$1" "$2" || bset "$1" WSDEAD "$(printf '%s\n%s' "$s" "$2")"; }
 ws_dead_clear() { local s; bv "$1" WSDEAD; s=$bvv; bset "$1" WSDEAD "$(grep -vxF "$2" <<<"$s")"; }
 
+# An issue whose own launch-target agent name (built the same way
+# launch_issue builds "$CUR_NAME-issue-$num") is still a live herdr agent
+# from a session that has not exited yet: "<nwo>#<num>" lines in
+# BOARD_<i>_AGENTBUSY. Unlike SKIP this is clearable (like ws_dead*): once
+# a later cycle's name check no longer finds that agent live, the launch
+# loop clears the mark so a genuinely new occurrence of the same issue
+# number still gets its own report instead of being silently swallowed by
+# a stale latch (#20).
+agent_busy()       { local s; bv "$1" AGENTBUSY; s=$bvv; [ -n "$2" ] && grep -qxF "$2" <<<"$s"; }
+agent_busy_mark()  { local s; bv "$1" AGENTBUSY; s=$bvv; agent_busy "$1" "$2" || bset "$1" AGENTBUSY "$(printf '%s\n%s' "$s" "$2")"; }
+agent_busy_clear() { local s; bv "$1" AGENTBUSY; s=$bvv; bset "$1" AGENTBUSY "$(grep -vxF "$2" <<<"$s")"; }
+
 # ---------------------------------------------------------------------------
 # Config: --config file, or the positional form synthesized into the exact
 # equivalent one-board config. Parsed and validated in ONE jq pass that
@@ -587,6 +599,10 @@ while IFS=$'\t' read -r _tag c_name c_kind c_repo c_path c_ws c_conc c_mode c_ow
   # Repos whose workspace died and could not be re-established (see ws_dead*):
   # gates claiming, cleared by the launch loop's own recovery retry.
   bset "$i" WSDEAD ""
+  # Issues whose launch-target agent is still live from a prior session
+  # (see agent_busy* above): gates claiming, cleared once that agent is
+  # no longer live.
+  bset "$i" AGENTBUSY ""
   # Cursor for the slow flight-age scan: epoch seconds before which the
   # scan does not run for this board. Seeded below with a per-board offset
   # so N boards' scans do not align into one API spike.
@@ -1834,7 +1850,7 @@ launch_issue() {
   done
   if [ "$attempt" -ge 10 ]; then
     log "issue #$num: agent start failed on pane $pane, closing tab $tab and releasing claim: $start_out"
-    report "issue #$num could not start: agent start failed on pane $pane. Tab closed and claim released, issue back in rotation."
+    report "issue #$num could not start: agent start failed on pane $pane: $start_out. Tab closed and claim released, issue back in rotation."
     herdr tab close "$tab" >/dev/null 2>&1
     board_release "$nwo" "$num"
     return 1
@@ -2106,6 +2122,22 @@ service_board_cycle() {
 
   if [ "$launch" -gt 0 ]; then
     launched=0
+    # One `herdr agent list` call up front, reused for every ready row
+    # below (see the agent_busy* check just after the cross-board dedupe):
+    # rules out relaunching an issue whose own launch-target agent name is
+    # still live from a prior session that has not exited yet (#20). A
+    # failure here is NOT fatal to this cycle's launches — it just means
+    # this cycle runs without that extra guard, exactly like every cycle
+    # before #20, so a transient herdr hiccup here costs at most one
+    # ordinary agent-start-failure-and-release, never a new stuck loop.
+    agent_list_out=$(herdr agent list 2>/dev/null)
+    agent_list_rc=$?
+    live_agent_names=""
+    if [ "$agent_list_rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$agent_list_out"; then
+      live_agent_names=$(jq -r '.result.agents[]? | (.name // "")' <<<"$agent_list_out")
+    else
+      log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — launching this cycle without the already-live-agent check"
+    fi
     while IFS=$'\t' read -r nwo num title; do
       [ "$launched" -ge "$launch" ] && break
       [ -z "$num" ] && continue
@@ -2117,6 +2149,29 @@ service_board_cycle() {
         log "issue #$num ($nwo): already in flight on another board, skipping"
         continue
       fi
+      # An issue whose own launch-target agent name — "$CUR_NAME-issue-$num",
+      # built identically to launch_issue's own $name — is still a live
+      # herdr agent means a prior session for THIS issue has not exited
+      # (it landed and the issue reopened, or it is simply still running).
+      # herdr agent names are global and unique, so claiming and launching
+      # into a name that is still taken only fails agent start, releases
+      # the claim, and re-claims it again next cycle forever (#20). Skip
+      # WITHOUT claiming instead. agent_busy latches the operator report to
+      # once per occurrence rather than every cycle, and is cleared below
+      # once the name is no longer live, so a later, genuinely new
+      # occurrence of the same issue number still gets reported.
+      agent_name="$CUR_NAME-issue-$num"
+      if [ -n "$live_agent_names" ] && grep -qxF "$agent_name" <<<"$live_agent_names"; then
+        if ! agent_busy "$CUR_IDX" "$nwo#$num"; then
+          agent_busy_mark "$CUR_IDX" "$nwo#$num"
+          log "issue #$num: agent $agent_name is already live; skipping without claiming"
+          report "issue #$num: already owned by a live session - its agent ($agent_name) is still running, most likely from a prior landing that has not exited yet. Skipped without claiming, not relaunched; it will be picked up automatically once that session exits."
+        else
+          log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
+        fi
+        continue
+      fi
+      agent_busy "$CUR_IDX" "$nwo#$num" && agent_busy_clear "$CUR_IDX" "$nwo#$num"
       # A repo whose workspace is gone and cannot be re-established gets no
       # claim at all: claiming an issue we cannot launch just releases it
       # again next cycle forever (issue #19), burning two label writes per
