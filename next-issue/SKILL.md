@@ -59,23 +59,43 @@ of `main`, same as before — only the mechanism changed, not the branch-selecti
 git -C <primary checkout path> worktree add <new checkout path> <existing-branch>
 ```
 
+Before touching any tab, decide which of the two cases below applies — that decision is
+conceptually the first thing to do, ahead of any tab action, though the `git worktree add`
+commands above are location-independent and may already have run regardless of which case
+applies.
+
 **Common case — your pane is already inside the target repo's own workspace.** This is
 true for both a watcher-launched session and the ordinary human-started standalone
 session. Nothing herdr-specific is needed: just record `<new checkout path>`, root every
 subsequent read/edit/command there (see step 4), and rename the tab you are already
-running in — no new tab, no new workspace:
+running in — no new tab, no new workspace. Use the convention matching how this session
+started:
 
 ```bash
+# Watcher-launched session: use the board's tab convention
+herdr tab rename "$HERDR_TAB_ID" "<board>/issue-<N>: <title>"
+
+# Standalone session: use the bare form
 herdr tab rename "$HERDR_TAB_ID" "issue-<N>: <TITLE>"
 ```
 
-(Watcher-launched sessions use the board's tab convention instead: `<board>/issue-<N>:
-<title>`.)
+Get this right the first time: a tab left in the bare form is invisible to the watcher's
+`sweep_finished_tabs` (it only matches `<board>/issue-<N>:`), and a tab in a primary
+workspace is unreachable by `sweep_orphan_worktrees` either way — exactly the
+label-matching failure this skill exists to avoid.
 
 **Rare fallback — your pane is NOT already inside the target repo's own workspace.**
-Check this before anything else (e.g. compare `$HERDR_WORKSPACE_ID` against the repo's
-own known/configured workspace id from `herdr workspace list`). If they differ, relocate
-your own running pane there first:
+Check this first, before any tab action: compare `$HERDR_WORKSPACE_ID` against the
+repo's own primary workspace id, found with the same predicate `watch.sh`'s startup
+validation uses — the workspace whose `.worktree.checkout_path` equals the primary
+checkout path and whose `.worktree.is_linked_worktree` is `false`:
+
+```bash
+herdr workspace list | jq -r '.result.workspaces[] | select(.worktree.checkout_path == "<primary checkout path>" and .worktree.is_linked_worktree == false) | .workspace_id'
+```
+
+If `$HERDR_WORKSPACE_ID` differs from that id, relocate your own running pane there
+first:
 
 ```bash
 herdr pane move "$HERDR_PANE_ID" --workspace <repo_workspace_id> --new-tab --no-focus
@@ -153,3 +173,8 @@ session has been running in the whole time (its id from the common case, or the
 move-result id from the fallback in step 2) needs closing. If unrecorded, `herdr tab
 list` and match the label prefix `issue-<N>:`. Never close the tab or remove the
 worktree before landing unless told to abandon the issue.
+
+Note: `git worktree remove` addresses the checkout by its recorded `<checkout path>`,
+not by the session's live cwd — even though step 4 keeps this session's cwd inside that
+same checkout the whole time, removing it does not pull the rug out from under the
+command doing the removing.
