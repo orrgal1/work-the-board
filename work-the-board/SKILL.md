@@ -91,6 +91,31 @@ primary workspace — its checkout matches `path`, and it is not itself a linked
 workspace — so a misconfigured value now fails loudly at startup instead of silently
 landing panes somewhere unrelated.
 
+**Workspace lifetime.** A herdr workspace is destroyed when its **last tab closes**, so a board's
+`workspace` is expected to be **long-lived** — it must outlive every session that lands in it. A
+workspace whose only tabs are transient (an issue tab, a research or `op:` tab) self-destructs the
+moment the last one is closed, and the board's configured id is then dead. Keep one permanent
+**anchor tab** in each repo's workspace so its tab count never reaches zero; the watcher names the
+ones it creates `<board> workspace anchor - do not close`, and neither sweep ever closes it.
+Closing an `op:` tab (step 6) or a research tab that happens to be the workspace's last tab is the
+normal way this breaks.
+
+If it does break, the watcher recovers rather than looping: on a `workspace_not_found` from `herdr
+tab create` it re-resolves that repo's own primary workspace from `path`, or re-opens `path` as a
+new workspace (with an anchor tab) if none is live, rewrites its in-memory repo map, and retries
+the launch — then reports the fault once per (board, repo), naming the board and the exact config
+field (`workspace`, or `repos[<k>].workspace`) and the new id. **The config file is never
+rewritten**: the runtime id is authoritative only for that run, and startup validation still exits
+2 on the stale id, so update the field when you see that report. If no workspace can be
+established either, the watcher reports one of two things depending on why. When herdr confirms
+the configured workspace is gone but a replacement could not be resolved this cycle — a transient
+herdr/git hiccup — it reports that as a transient issue, not a config fault, and expects the next
+cycle's local retry to resolve it on its own. When it is a genuine, repeatable fault — usually
+`path` itself is gone or no longer resolves to a usable checkout — it reports a config fault
+instead, naming the field to update. Either way the claim is released and the watcher **stops
+claiming issues for that repo entirely** (rather than claiming and releasing one every cycle); it
+retries locally each cycle and resumes on its own once the path has a usable workspace.
+
 ## Running several boards
 
 Use one watcher process for several boards when: independent boards run over one repo, one project board spans repos, or several repos need boards in the same session. Pass `--config <file>` instead of the positional args and mode; the file is loaded and validated once at startup and never re-read — changing it means restarting the watcher.
@@ -112,7 +137,7 @@ Use one watcher process for several boards when: independent boards run over one
 
 `poll_seconds` (optional, default 30) and `report_agent` (optional) are watcher-wide. Each board needs a unique `name` matching `^[a-z0-9-]+$` (it labels that board's tabs and agents), a `kind` (`repo` or `project`), and `concurrency` — required, never defaulted, per board. `mode` defaults `supervised`. A `repo` board additionally needs `repo` (`owner/repo`), `path`, `workspace`. A `project` board needs `owner`, `number`, and a non-empty `repos` array of `{repo, path, workspace}` — one entry per repo the board spans.
 
-Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, a `workspace` that isn't that repo's own primary herdr workspace (its checkout must equal `path`, and it must not itself be a linked-worktree workspace — not merely "a workspace that exists"), or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
+Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, a `workspace` that isn't that repo's own primary herdr workspace (its checkout must equal `path`, and it must not itself be a linked-worktree workspace — not merely "a workspace that exists"; a `workspace` that exists at startup but is destroyed later is handled at runtime, not here — see "Workspace lifetime"), or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
 
 ## 4. Start the watcher
 
@@ -157,7 +182,7 @@ A project board's items are dispatched into their own mapped repo's `path` and `
 
 `watch.sh` encodes several `herdr`/`jq` response-shape and shell-quoting pitfalls — see its comments. Reuse it verbatim rather than re-deriving them.
 
-**Reporting.** Every report line is prefixed `[<board-name>]`, so with several boards in one process you can tell them apart — `[harness] issue #42 launched...`. With a report target, the watcher prompts that agent on material changes only: an issue launched (number, title, tab) and claimed; an issue that **left flight** — landed, closed, or claim dropped elsewhere — with its new state (the only way a session landing its own issue becomes visible from here); any launch failure, and whether the claim was released; a board going degraded or recovering (above); and an issue that has been in flight for over an hour, repeated on every further hour boundary it crosses (state for this lives in a hidden marker comment on the issue itself, not a local file, so it survives a watcher restart). Idle cycles are never reported. Sends are fire-and-forget, never `--wait`, so a busy board session cannot stall the loop. Startup and stop each send one consolidated, unprefixed message covering every configured board, not one message per board. Relay these to the operator; they are the board's audit trail.
+**Reporting.** Every report line is prefixed `[<board-name>]`, so with several boards in one process you can tell them apart — `[harness] issue #42 launched...`. With a report target, the watcher prompts that agent on material changes only: an issue launched (number, title, tab) and claimed; an issue that **left flight** — landed, closed, or claim dropped elsewhere — with its new state (the only way a session landing its own issue becomes visible from here); any launch failure, and whether the claim was released; a board's configured `workspace` having been destroyed at runtime — reported once per (board, repo) as a **config fault** naming the field, either recovered-for-this-run with the new id or unrecoverable with the exact fix, never repeated every cycle; a board going degraded or recovering (above); and an issue that has been in flight for over an hour, repeated on every further hour boundary it crosses (state for this lives in a hidden marker comment on the issue itself, not a local file, so it survives a watcher restart). Idle cycles are never reported. Sends are fire-and-forget, never `--wait`, so a busy board session cannot stall the loop. Startup and stop each send one consolidated, unprefixed message covering every configured board, not one message per board. Relay these to the operator; they are the board's audit trail.
 
 **Landing is the operator's call.** The handed-over prompt tells a supervised session to stop after pushing and leave `gh pr ready`, merging, closing and worktree removal to explicit instruction given **in the issue's own tab** (`land`, `ready`, `done`) — the board session never sees it. So a `left flight (issue is now CLOSED)` report is normally the operator landing it directly; before raising an alarm, check the owning session's transcript (`herdr agent list` gives its `agent_session` path) rather than the board:
 
@@ -180,7 +205,7 @@ herdr pane get <PANE_ID>   # agent_status should be "working" or "idle", not "un
 
 A pane stuck at `agent_status: "unknown"` with no session file means the launch failed in a way the script didn't catch; stop the watcher and re-check the `herdr` CLI surface (`herdr tab create --help`, `herdr agent start --help`) before restarting it.
 
-Also confirm nesting: `herdr pane get <PANE_ID>` (or `herdr workspace get <id>`) should report the launched issue's pane `workspace_id` equal to the board's configured `workspace` — it landed as a tab in the repo's own workspace, not somewhere else.
+Also confirm nesting: `herdr pane get <PANE_ID>` (or `herdr workspace get <id>`) should report the launched issue's pane `workspace_id` equal to the workspace the board is currently using for that repo — normally the configured `workspace`, or the id named in a workspace-recovery report if one has fired (see "Workspace lifetime") — it landed as a tab in the repo's own workspace, not somewhere else.
 
 `ready=0` with everything genuinely blocked or claimed is the correct steady state: report that as-is rather than forcing work.
 
@@ -254,6 +279,9 @@ unconditionally at Stop (below); close it the first time its status reads `idle`
 or orphaned, per the table above.
 Never close a tab that reads `working` or `blocked` — `blocked` means the operator hasn't
 answered it yet, not that the operation is finished.
+Before closing an op tab, note whether it is the **last** tab in that repo's workspace (`herdr
+workspace list` reports `tab_count`): closing it destroys the workspace, which is what the anchor
+tab in "Where panes live" exists to prevent.
 
 ## 7. Stop
 
