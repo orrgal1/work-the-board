@@ -252,7 +252,12 @@ def berrs($i):
          end) | @tsv),
     ($cfg.boards[] | .name as $b
       | (if .kind == "repo" then {repo: .repo, path: .path} else (.repos[] | {repo: .repo, path: .path}) end)
-      | ["RCHECK", $b, .repo, .path] | @tsv)
+      | ["RCHECK", $b, .repo, .path] | @tsv),
+    ($cfg.boards[] | .name as $b
+      | (if .kind == "repo" then [{field: "workspace", ws: .workspace}]
+         else [ .repos | to_entries[] | {field: "repos[\(.key)].workspace", ws: .value.workspace} ]
+         end)[]
+      | ["WSCHECK", $b, .field, .ws] | @tsv)
   end
 '
 
@@ -354,6 +359,27 @@ while IFS=$'\t' read -r _tag b r p; do
   o_owner="${o_owner##*:}"
   if [ "$o_owner/$o_repo" != "$r" ]; then
     echo "watch.sh: config: board $b: repo: $r does not match the origin remote of $p ($origin_url)" >&2
+    exit 2
+  fi
+done <<<"$rows"
+
+# Workspace-existence validation, still before the first cycle: every board's
+# workspace must be a live herdr workspace. A stale or nonexistent workspace
+# id currently passes validation, then launch_issue's `herdr tab create
+# --workspace` fails with workspace_not_found forever — the claim is released
+# and the failure repeats every poll cycle with no indication the cause is
+# config rather than a transient herdr fault.
+ws_list_out=$(herdr workspace list 2>&1)
+ws_list_rc=$?
+if [ "$ws_list_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$ws_list_out"; then
+  echo "watch.sh: config: herdr workspace list failed: $ws_list_out" >&2
+  exit 2
+fi
+live_ws=$(jq -r '.result.workspaces[]?.workspace_id // empty' <<<"$ws_list_out")
+while IFS=$'\t' read -r _tag b field ws; do
+  [ "$_tag" = "WSCHECK" ] || continue
+  if ! grep -qx -- "$ws" <<<"$live_ws"; then
+    echo "watch.sh: config: board $b: $field: workspace does not exist: $ws" >&2
     exit 2
   fi
 done <<<"$rows"
