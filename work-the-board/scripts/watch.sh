@@ -220,6 +220,18 @@ ws_dead()       { local s; bv "$1" WSDEAD; s=$bvv; [ -n "$2" ] && grep -qxF "$2"
 ws_dead_mark()  { local s; bv "$1" WSDEAD; s=$bvv; ws_dead "$1" "$2" || bset "$1" WSDEAD "$(printf '%s\n%s' "$s" "$2")"; }
 ws_dead_clear() { local s; bv "$1" WSDEAD; s=$bvv; bset "$1" WSDEAD "$(grep -vxF "$2" <<<"$s")"; }
 
+# An issue whose own launch-target agent name (built the same way
+# launch_issue builds "$CUR_NAME-issue-$num") is still a live herdr agent
+# from a session that has not exited yet: "<nwo>#<num>" lines in
+# BOARD_<i>_AGENTBUSY. Unlike SKIP this is clearable (like ws_dead*): once
+# a later cycle's name check no longer finds that agent live, the launch
+# loop clears the mark so a genuinely new occurrence of the same issue
+# number still gets its own report instead of being silently swallowed by
+# a stale latch (#20).
+agent_busy()       { local s; bv "$1" AGENTBUSY; s=$bvv; [ -n "$2" ] && grep -qxF "$2" <<<"$s"; }
+agent_busy_mark()  { local s; bv "$1" AGENTBUSY; s=$bvv; agent_busy "$1" "$2" || bset "$1" AGENTBUSY "$(printf '%s\n%s' "$s" "$2")"; }
+agent_busy_clear() { local s; bv "$1" AGENTBUSY; s=$bvv; bset "$1" AGENTBUSY "$(grep -vxF "$2" <<<"$s")"; }
+
 # ---------------------------------------------------------------------------
 # Config: --config file, or the positional form synthesized into the exact
 # equivalent one-board config. Parsed and validated in ONE jq pass that
@@ -587,6 +599,10 @@ while IFS=$'\t' read -r _tag c_name c_kind c_repo c_path c_ws c_conc c_mode c_ow
   # Repos whose workspace died and could not be re-established (see ws_dead*):
   # gates claiming, cleared by the launch loop's own recovery retry.
   bset "$i" WSDEAD ""
+  # Issues whose launch-target agent is still live from a prior session
+  # (see agent_busy* above): gates claiming, cleared once that agent is
+  # no longer live.
+  bset "$i" AGENTBUSY ""
   # Cursor for the slow flight-age scan: epoch seconds before which the
   # scan does not run for this board. Seeded below with a per-board offset
   # so N boards' scans do not align into one API spike.
@@ -1725,7 +1741,7 @@ board_repo_launchable() {   # <nwo>
 # issue. Releases the claim and cleans up the tab if anything fails.
 launch_issue() {
   local nwo="$1" num="$2" title="$3"
-  local name create_json pane tab start_out attempt prompt err_code ws_retry
+  local name create_json pane tab start_out start_out_report attempt prompt err_code ws_retry
   local pr_info pr_num pr_branch adopt branch_only item_path item_ws orig_ws
 
   # Cross-repo dispatch: every downstream call for this item — the tab and
@@ -1834,7 +1850,19 @@ launch_issue() {
   done
   if [ "$attempt" -ge 10 ]; then
     log "issue #$num: agent start failed on pane $pane, closing tab $tab and releasing claim: $start_out"
-    report "issue #$num could not start: agent start failed on pane $pane. Tab closed and claim released, issue back in rotation."
+    # Collapsed and bounded for the operator report only (review #20 MN3):
+    # $start_out is herdr's raw, possibly multi-line/arbitrary-length stderr
+    # capture, and an empty capture must not render as a bare trailing
+    # colon. start_out_report collapses it to one line so it slots cleanly
+    # mid sentence, truncates it with a marker so the operator can tell
+    # there is more in the log, and substitutes a placeholder when empty;
+    # the untruncated original is already in the log line above.
+    start_out_report=${start_out//$'\n'/ }
+    if [ "${#start_out_report}" -gt 300 ]; then
+      start_out_report="${start_out_report:0:300}…"
+    fi
+    [ -z "$start_out_report" ] && start_out_report="(herdr reported no error output)"
+    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closed and claim released, issue back in rotation."
     herdr tab close "$tab" >/dev/null 2>&1
     board_release "$nwo" "$num"
     return 1
@@ -2104,17 +2132,112 @@ service_board_cycle() {
 
   log "in-flight=$count free=$free ready=$ready_n launching=$launch"
 
+  # Fetch + reconcile herdr agent list whenever there is ready work to
+  # gate OR this board holds any AGENTBUSY latch that might need
+  # clearing (review #20 round 4 BL1). Reconciling only inside the
+  # ready-row loop below left a latch's clear path reachable ONLY when
+  # the per-issue loop actually reached that exact row - but the
+  # cycle-top CYCLE_SEEN seed (see the main loop's "Cross-board dedupe
+  # union for THIS cycle") puts every latched "<nwo>#<num>" into
+  # CYCLE_SEEN before ANY board runs, so the owning board's own
+  # per-issue loop dedupe-skips that row at the very first check below,
+  # before ever reaching the agent-busy check that used to clear it -
+  # starving the issue forever, on every board, once the blocking
+  # session exits, until a watcher restart. A board at full concurrency
+  # (launch=0) never even entered the old fetch block, so its stale
+  # latch could never clear at all while still poisoning CYCLE_SEEN for
+  # siblings. Reconciling here, independent of free capacity and of the
+  # per-issue loop, keeps the clear path reachable in both cases; a
+  # one-cycle relaunch lag after clearing is expected and fine (this
+  # cycle's CYCLE_SEEN seed already predates the clear).
+  bv "$CUR_IDX" AGENTBUSY
+  agentbusy_snapshot=$bvv
+  agent_list_ok=0
+  live_agent_names=""
+  if [ "$launch" -gt 0 ] || [ -n "$agentbusy_snapshot" ]; then
+    # agent_list_ok carries the fetch outcome explicitly rather than
+    # being inferred from live_agent_names being empty (review #20
+    # MJ1): "fetch succeeded, zero live agents" and "fetch failed" are
+    # both empty-string cases and must not be conflated, or a failed
+    # fetch reads as proof no agent is live and wrongly clears every
+    # currently-latched agent_busy mark, re-arming the report and the
+    # claim/release churn on every herdr flap. A failed fetch is NOT
+    # fatal to this cycle's launches — it just means this cycle runs
+    # without the extra guard, exactly like every cycle before #20, so
+    # one bad fetch costs at most one ordinary agent-start-failure-and-
+    # release, never a new stuck loop.
+    agent_list_out=$(herdr agent list 2>/dev/null)
+    agent_list_rc=$?
+    if [ "$agent_list_rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$agent_list_out"; then
+      agent_list_ok=1
+      live_agent_names=$(jq -r '.result.agents[]? | (.name // "")' <<<"$agent_list_out")
+    else
+      log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — launching this cycle without the already-live-agent check"
+      if skip_once "agent-list-failed-launch-gate"; then
+        report "herdr agent list failed or returned invalid JSON — launching without the check that skips relaunching an issue whose own agent is still live (#20's guard). If this repeats, the old per-cycle claim/release loop for such an issue can recur; a transient herdr fault is the likely cause."
+      fi
+    fi
+    if [ "$agent_list_ok" -eq 1 ] && [ -n "$agentbusy_snapshot" ]; then
+      while IFS= read -r busy_key; do
+        [ -z "$busy_key" ] && continue
+        busy_num=${busy_key##*#}
+        [ -z "$busy_num" ] && continue
+        grep -qxF "$CUR_NAME-issue-$busy_num" <<<"$live_agent_names" || agent_busy_clear "$CUR_IDX" "$busy_key"
+      done <<<"$agentbusy_snapshot"
+    fi
+  fi
+
   if [ "$launch" -gt 0 ]; then
     launched=0
     while IFS=$'\t' read -r nwo num title; do
       [ "$launched" -ge "$launch" ] && break
       [ -z "$num" ] && continue
       # Cross-board dedupe: an issue legitimately sitting on two boards (a
-      # label board and a project board, say) must still run only once.
-      # First in-flight sighting or first claim this cycle wins; the loser
-      # skips quietly - a log line, not an operator report.
+      # label board and a project board, say) must still run only once,
+      # and a ready issue latched agent_busy on ANY board (its own
+      # AGENTBUSY seeded into CYCLE_SEEN at cycle-top, or another board's
+      # right here in this same cycle) must not be claimed either. First
+      # in-flight sighting, first claim, or first agent-busy latch this
+      # cycle wins; the loser skips quietly - a log line, not an operator
+      # report.
       if grep -qxF "$nwo#$num" <<<"$CYCLE_SEEN"; then
-        log "issue #$num ($nwo): already in flight on another board, skipping"
+        log "issue #$num ($nwo): already accounted for this cycle (in flight elsewhere, or a still-latched live-agent skip), skipping"
+        continue
+      fi
+      # An issue whose own launch-target agent name — "$CUR_NAME-issue-$num",
+      # built identically to launch_issue's own $name — is still a live
+      # herdr agent means a session holding that exact name has not
+      # exited (normally this issue's own prior session; on a project
+      # board spanning repos the same board+number can instead belong to
+      # another repo's issue #$num, since the name is not repo-qualified
+      # — the report below hedges accordingly, review #20 MN2). herdr
+      # agent names are global and unique, so claiming and launching into
+      # a name that is still taken only fails agent start, releases the
+      # claim, and re-claims it again next cycle forever (#20). Skip
+      # WITHOUT claiming instead, and also fold this row into CYCLE_SEEN
+      # (review #20 MJ2): otherwise a sibling board sharing this repo
+      # sees the issue as un-owned (it is by definition not mgr:in-flight
+      # here — its prior session already dropped that on landing) and
+      # launches a second, concurrent session under its OWN board-name on
+      # the same issue and worktree. agent_busy latches the operator
+      # report to once per occurrence rather than every cycle — gated on
+      # agent_list_ok so a failed fetch (empty live_agent_names for the
+      # wrong reason) can never look like a match. The latch is cleared
+      # by the reconcile pass above this loop, not here (review #20
+      # round 4 BL1): clearing in-loop was only reachable when the
+      # per-issue loop got to this exact row, which the cycle-top
+      # CYCLE_SEEN seed (see above) prevents from cycle 2 of an
+      # occurrence onward.
+      agent_name="$CUR_NAME-issue-$num"
+      if [ "$agent_list_ok" -eq 1 ] && grep -qxF "$agent_name" <<<"$live_agent_names"; then
+        CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
+        if ! agent_busy "$CUR_IDX" "$nwo#$num"; then
+          agent_busy_mark "$CUR_IDX" "$nwo#$num"
+          log "issue #$num: agent $agent_name is already live; skipping without claiming"
+          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue: no action needed, it self-heals and this issue launches automatically once that session exits and frees the name. If that session has already finished, close its tab to free the name now. On a multi-repo project board the name can instead belong to a different repo's issue #$num sharing the same board+number - free it without disturbing that other session via herdr agent rename $agent_name --clear."
+        else
+          log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
+        fi
         continue
       fi
       # A repo whose workspace is gone and cannot be re-established gets no
@@ -2252,16 +2375,33 @@ fi
 
 while true; do
   # Cross-board dedupe union for THIS cycle: every board's last-observed
-  # in-flight "<nwo>#<num>" keys. Each board refreshes its own contribution
-  # when its fresh fetch lands, and claims append immediately (see the
-  # launch loop) — the only cross-board coupling in the watcher, read-only
-  # apart from those insertions.
+  # in-flight "<nwo>#<num>" keys, PLUS every board's own currently-latched
+  # AGENTBUSY keys (review #20 round 3 MJ5). PREV_INFLIGHT alone is not
+  # enough for a live-agent-blocked issue: it is by definition NOT in
+  # flight (its prior session already dropped mgr:in-flight on landing),
+  # so without this the within-cycle CYCLE_SEEN append the launch loop's
+  # skip branch does (see there) protects only sibling boards serviced
+  # AFTER the owning board in THIS cycle, and evaporates at the very next
+  # cycle's reset below — a sibling board serviced first, or serviced on
+  # any later cycle, would see the issue as unclaimed and launch a SECOND
+  # concurrent session beside the still-live one. AGENTBUSY's lines are
+  # already exact "<nwo>#<num>" CYCLE_SEEN keys, so folding them in here
+  # closes that gap for every cycle where the owning board has latched
+  # the issue at least once; only a genuine one-poll race (sibling claims
+  # before the owning board has ever seen the issue ready) remains, the
+  # same class as the pre-existing cross-board claim race board_claim
+  # already arbitrates. Each board refreshes its own contribution when
+  # its fresh fetch lands, and claims append immediately (see the launch
+  # loop) — the only cross-board coupling in the watcher, read-only apart
+  # from those insertions.
   CYCLE_SEEN=""
   CYCLE_WS_SKIP=""
   CYCLE_WS_OK=""
   b=0
   while [ "$b" -lt "$NBOARDS" ]; do
     bv "$b" PREV_INFLIGHT
+    [ -n "$bvv" ] && CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$bvv")
+    bv "$b" AGENTBUSY
     [ -n "$bvv" ] && CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$bvv")
     b=$((b + 1))
   done
