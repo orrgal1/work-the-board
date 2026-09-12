@@ -111,6 +111,16 @@ pull a foreign repo's refs into it (this has happened: it moved a primary checko
 `origin/main` to a different project's history entirely). The only valid repair is
 remove and re-create.
 
+The worktree verified, take two records now, before any implementation work, regardless of which tab case applies below:
+
+```bash
+realpath <new checkout path>                        # the absolute worktree path every subagent brief will carry
+git -C <primary checkout path> status --porcelain -uall   # the primary checkout's pre-existing dirt — the baseline
+git -C <primary checkout path> rev-parse HEAD              # the primary checkout's baseline HEAD
+```
+
+Record `<new checkout path>` absolute because step 4 forbids relative paths in subagent briefs. The baseline is what "clean" means for this session: whatever it lists now was there before this session started and is not yours to touch — or to clean up — and the baseline HEAD is what "clean" means for the primary checkout's own history, the value it must still point to for the same reason. See "Leave the primary checkout as you found it" below.
+
 Before touching any tab, decide which of the two cases below applies — that decision is
 conceptually the first thing to do, ahead of any tab action, though the two `worktree
 add` commands at the top of this step are location-independent and may already have
@@ -188,6 +198,33 @@ gh pr create --draft --fill --head issue-<N>-<slug> --base main --body "Closes #
 Every read, edit, and command for this issue runs rooted at the worktree path — never
 the primary checkout. Do not touch files outside it. Do not merge or close anything yet.
 
+Subagents are where this rule breaks: a relative path in a subagent's tool call resolves against this session's base cwd — the primary checkout — not against whatever worktree its brief names. Twice this has written superseded drafts into a primary checkout and blocked its next `git pull --ff-only` there. So every subagent brief — builder, plan, or review — states the worktree as the absolute path recorded in step 2 and requires absolute paths in every file operation it hands out; a brief that names the worktree but passes relative paths is a bug, however clear its intent. The same risk applies to commands, not just file operations: a subagent running a shell command from its own base cwd — a stray `git commit`, a script — can land in the primary checkout without ever touching a file the porcelain compare below would catch, because it operates on git state instead, and can still break `git pull --ff-only` there. So every subagent brief also sets the working directory of every command it hands out to the worktree, or otherwise scopes that command to it explicitly — not just its file read/write paths.
+
+When a subagent's first result comes back, confirm one file it claims to have written actually exists under `<new checkout path>` before building on it — a leak caught at the first slice costs one `read`; caught at the finish line it costs a re-run.
+
+## Leave the primary checkout as you found it
+
+The finish line for this session is any of: a supervised stop-and-report after pushing, closing the issue (landing in step 6, or abandoning in step 7), and removing the worktree in step 7. Before each, re-run the baseline commands from step 2 and compare:
+
+```bash
+git -C <primary checkout path> status --porcelain -uall
+git -C <primary checkout path> rev-parse HEAD
+```
+
+The comparison matches by path only, ignoring any status-code change on an already-baselined path — an operator staging a pre-existing modification mid-session is still baseline, not a new leak. Every path already in the baseline, by that path-only match, is pre-existing local state — someone's intentional edits, nothing to do with this issue — leave it alone.
+
+The comparison also re-checks the baseline HEAD and watches for a baselined path that has disappeared from the porcelain listing entirely. Either signals that a stray git command ran in the primary checkout during this session (see step 4) — a stray commit can move HEAD and, if it swept up a baseline-dirty path, remove that path from the listing too, so the comparison must not reason only about paths still present. Neither is auto-repaired: an operator's own mid-session pull also legitimately moves HEAD, and this session cannot tell the difference. Name the changed HEAD or the vanished path in the report instead, the same as any other unattributable state.
+
+A path new since the baseline is not automatically this session's fault: this session shares the primary checkout with an operator and other tools, and a third party can touch a file there for reasons unrelated to this issue while this session is alive. Restore only the new paths this session can actually attribute to itself — a path a subagent brief named, a path a subagent result claimed to have written, or a path one of this session's own commands touched. This matching compares tree-relative paths: a brief that named `<new checkout path>/src/foo.ts` attributes a leak that appears as `src/foo.ts` in the primary checkout's porcelain output. Naming a path in a brief is only evidence a leak was possible there, not that one occurred — before restoring a path attributed solely by brief-naming (not also by a subagent result's claim or by this session's own command having touched it), confirm the dirty content actually corresponds to this session's work, for example that it reads as a draft or variant of the corresponding worktree file's content. If it doesn't, it's a third party's edit, not a leak: leave it and name it in the report, the same as the other unattributable cases below. Restore each one by its exact path, and only those:
+
+```bash
+git -C <primary checkout path> checkout -- <path>    # tracked file modified or deleted
+rm <primary checkout path>/<path>                     # untracked file that appeared
+git -C <primary checkout path> restore --source=HEAD --staged --worktree -- <path>   # leak that got staged
+```
+
+Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the primary checkout: the baseline can hold intentional local edits unrelated to any issue (it has), and a blanket restore destroys them. A path that is in the baseline but that this session may also have written to, and a new-since-baseline path this session cannot attribute to itself (by brief, result, or command, or whose brief-named content doesn't correspond per above), both cannot be restored safely — leave each one and name it in the report instead, rather than assuming every non-baseline path is this session's leak. Name every path restored or deliberately left in the final report; a comparison showing nothing new needs no more than that it passed.
+
 ## 5. On "ready"
 
 Only when explicitly instructed:
@@ -201,7 +238,7 @@ or trigger the workflow if it doesn't run automatically); if unavailable, say so
 
 ## 6. On "land"
 
-Only when explicitly instructed:
+Only when explicitly instructed, and after the primary-checkout comparison ("Leave the primary checkout as you found it") has been re-run after this session's own last file operation, immediately before merging:
 
 ```bash
 gh pr merge <PR_N> --squash --delete-branch
@@ -218,7 +255,9 @@ Confirm the merge succeeded (`gh pr view <PR_N> --json state`) before closing th
 
 Only when explicitly instructed, and only after landing (or after being told to abandon
 the issue without landing — in that case remove `mgr:in-flight` and leave the issue open
-with a comment explaining why, before proceeding):
+with a comment explaining why, before proceeding), and after running the primary-checkout
+comparison ("Leave the primary checkout as you found it") — this session's last chance to
+restore anything:
 
 ```bash
 cd <primary checkout path>
