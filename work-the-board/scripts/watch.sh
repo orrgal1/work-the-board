@@ -172,14 +172,14 @@ repo_workspace() { # <i> <nwo>
 # value is authoritative at startup (WSCHECK), this map is authoritative for
 # dispatch during the run. Keeps CUR_REPOMAP (the copy board_ctx_load took)
 # and BOARD_<i>_WS in step, so nothing in the process can read a stale id.
-repo_set_workspace() {   # <i> <nwo> <ws>
+repo_set_workspace() {   # <i> <nwo> <new_ws> <old_ws>
   local m
   bv "$1" REPOMAP
   m=$(awk -F'\t' -v OFS='\t' -v r="$2" -v w="$3" '$1 == r { $3 = w } { print }' <<<"$bvv")
   bset "$1" REPOMAP "$m"
   [ "$1" = "${CUR_IDX:-}" ] && CUR_REPOMAP=$m
   bv "$1" WS
-  if [ "$bvv" = "$4" ]; then          # <4> = the old id being replaced
+  if [ "$bvv" = "${4-}" ]; then       # <4> = the old id being replaced
     bset "$1" WS "$3"
     [ "$1" = "${CUR_IDX:-}" ] && CUR_WS=$3
   fi
@@ -472,18 +472,30 @@ ws_worktree_fields() { # <ws_list_json> <ws_id>
 # prints the id of a live herdr workspace that IS that path's own primary
 # workspace, by the same rule WSCHECK enforces at startup (worktree present,
 # checkout_path resolving to the same git toplevel via repo_root_for, and
-# is_linked_worktree false). rc 1 when no such workspace exists.
+# is_linked_worktree false). rc 0 with the id printed means a match; rc 1
+# means no such workspace exists (safe to create one); rc 2 means it could
+# NOT be determined (repo_root_for failed, herdr workspace list failed, or
+# its output was not valid JSON) - callers MUST treat rc 2 as "do not know",
+# never as "none exists", or a transient herdr hiccup forks a second
+# workspace onto a checkout that may already have a live one (#14).
 #
 # Kept separate from WSCHECK on purpose: WSCHECK answers "is THIS configured
 # id right, and if not, exactly how is it wrong" (with its own transient
 # worktree:null retry and its own exit-2 messages); this answers "which id is
 # right for this path, if any". Same predicate, two questions - if the rule
 # changes, change both. Nothing here weakens or repeats the startup check.
+#
+# Deliberate simplification, not an oversight: unlike WSCHECK, this does NOT
+# retry a transiently-null worktree field (herdr has been observed to report
+# worktree: null for a workspace that is moments later correct). WSCHECK's
+# own retry loop is untouched and stays the belt this does not duplicate; a
+# workspace whose worktree is transiently null here just isn't matched this
+# call, and the pre-claim gate calls this again next cycle anyway.
 resolve_primary_workspace() {   # <path>
   local out want id checkout linked root
-  want=$(repo_root_for "$1") || return 1
-  out=$(herdr workspace list 2>/dev/null) || return 1
-  jq -e . >/dev/null 2>&1 <<<"$out" || return 1
+  want=$(repo_root_for "$1") || return 2
+  out=$(herdr workspace list 2>/dev/null) || return 2
+  jq -e . >/dev/null 2>&1 <<<"$out" || return 2
   while IFS=$'\t' read -r id checkout linked; do
     [ -z "$id" ] && continue
     [ "$linked" = "false" ] || continue
@@ -1308,17 +1320,26 @@ existing_branch_for() { # <path> <num>
 WS_ENSURE_ERR=""
 WS_ENSURE_NEW=""
 ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
-  local nwo="$1" path="$2" old="$3" field found out new anchor linked
+  local nwo="$1" path="$2" old="$3" field found out new anchor linked rpw_rc
   WS_ENSURE_ERR=""
   field=$(repo_ws_field "$CUR_IDX" "$nwo")
 
-  if found=$(resolve_primary_workspace "$path"); then
+  found=$(resolve_primary_workspace "$path"); rpw_rc=$?
+  if [ "$rpw_rc" -eq 0 ]; then
     repo_set_workspace "$CUR_IDX" "$nwo" "$found" "$old"
-    log "board $CUR_NAME: config field $field workspace $old no longer exists; adopted live primary workspace $found for $path" >&2
+    log "board $CUR_NAME: config field $field workspace $old no longer exists; adopted live primary workspace $found for $path"
     if skip_once "ws-recovered:$nwo"; then
       report "config fault, recovered for this run: $field is workspace $old, which no longer exists - herdr destroys a workspace when its last tab closes. Launches for $nwo now use $found, this repo's own live primary workspace for $path. Set $field to $found in the config: a restart still exits 2 on the stale id."
     fi
     WS_ENSURE_NEW="$found"; return 0
+  elif [ "$rpw_rc" -eq 2 ]; then
+    # Could not determine whether $path already has a live primary
+    # workspace (repo_root_for failed, herdr workspace list failed, or its
+    # output was not valid JSON): a plain transient failure, NOT license to
+    # create - creating here on a false "none exists" reading forks a
+    # second workspace onto a checkout that may already have a live one.
+    WS_ENSURE_ERR="could not determine whether $path already has a live primary workspace (herdr unreachable or returned unparseable output); not creating a new one"
+    return 1
   fi
 
   out=$(herdr workspace create --cwd "$path" --label "$(basename "$path")" --no-focus 2>&1)
@@ -1332,19 +1353,20 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   # entitled to reap. Only an explicit true fails; an absent field is fine.
   linked=$(jq -r '.result.workspace.worktree.is_linked_worktree // empty' <<<"$out" 2>/dev/null)
   if [ "$linked" = "true" ]; then
-    WS_ENSURE_ERR="$path is a linked git worktree, not a primary checkout: herdr opened it as linked-worktree workspace $new"
+    herdr workspace close "$new" >/dev/null 2>&1
+    WS_ENSURE_ERR="$path is a linked git worktree, not a primary checkout: herdr opened it as linked-worktree workspace $new (closed it before returning)"
     return 1
   fi
   anchor=$(jq -r '.result.tab.tab_id // empty' <<<"$out" 2>/dev/null)
   # herdr's workspace create returns .result.workspace/.result.tab/.result.root_pane
   # (verified against `herdr --skill`): the new workspace already HAS a root
   # tab, and naming it is what stops the workspace dying again the moment the
-  # last issue tab closes. Never closed by either sweep: it carries no
-  # <board>/issue-<N>: label, no digits at all, and it is not a
-  # linked-worktree workspace.
+  # last issue tab closes. Never closed by either sweep: its label matches
+  # neither sweep_finished_tabs' "^[a-z0-9-]+/issue-[0-9]+:" pattern nor the
+  # orphan sweep's linked-worktree + numeric-label check.
   [ -n "$anchor" ] && herdr tab rename "$anchor" "$CUR_NAME workspace anchor - do not close" >/dev/null 2>&1
   repo_set_workspace "$CUR_IDX" "$nwo" "$new" "$old"
-  log "board $CUR_NAME: config field $field workspace $old no longer exists and $path has no live primary workspace; created $new (anchor tab ${anchor:-none})" >&2
+  log "board $CUR_NAME: config field $field workspace $old no longer exists and $path has no live primary workspace; created $new (anchor tab ${anchor:-none})"
   if skip_once "ws-recovered:$nwo"; then
     report "config fault, recovered for this run: $field is workspace $old, which no longer exists - herdr destroys a workspace when its last tab closes, and nothing was holding this one open. Re-opened $path as workspace $new with an anchor tab named $CUR_NAME workspace anchor - do not close; launches for $nwo use it from now on. Set $field to $new in the config (a restart still exits 2 on the stale id) and leave the anchor tab open."
   fi
@@ -1353,19 +1375,18 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
 
 # Pre-claim gate for a repo previously found unusable: retries the recovery
 # (local herdr calls only - no GitHub call, no claim, nothing to release) so
-# the board picks itself up without a restart, and reports the state EXIT the
-# way service_board reports "recovered". rc 1 means "do not claim for this
-# repo this cycle".
+# the board picks itself up without a restart. The recovery's own latched
+# report (ensure_repo_workspace's "ws-recovered:<nwo>") already tells the
+# operator about the transition with the field name, old id, and new id -
+# this does not report again, only clears WSDEAD. rc 1 means "do not claim
+# for this repo this cycle".
 board_repo_launchable() {   # <nwo>
-  local path old new field
+  local path old
   ws_dead "$CUR_IDX" "$1" || return 0
   path=$(repo_path "$CUR_IDX" "$1") || return 0        # unmapped: leave it to launch_issue's BUG branch
   old=$(repo_workspace "$CUR_IDX" "$1") || return 0
   ensure_repo_workspace "$1" "$path" "$old" || return 1
-  new=$WS_ENSURE_NEW
-  field=$(repo_ws_field "$CUR_IDX" "$1")
   ws_dead_clear "$CUR_IDX" "$1"
-  report "workspace for $1 recovered: launches now use $new ($path). Set $field to $new in the config; a restart still exits 2 on the stale id."
   return 0
 }
 
@@ -1404,11 +1425,22 @@ launch_issue() {
     # herdr puts its failure JSON on stderr (stdout stays empty), so the 2>&1
     # capture above is exactly one document: .error.code is the class.
     err_code=$(jq -r '.error.code // empty' <<<"$create_json" 2>/dev/null)
-    if [ "$err_code" = "workspace_not_found" ] && [ "$ws_retry" -eq 0 ]; then
-      ws_retry=1
-      if ensure_repo_workspace "$nwo" "$item_path" "$item_ws"; then
-        item_ws=$WS_ENSURE_NEW   # REPOMAP already rewritten; retry once, claim held
-        continue
+    if [ "$err_code" = "workspace_not_found" ]; then
+      if [ "$ws_retry" -eq 0 ]; then
+        ws_retry=1
+        if ensure_repo_workspace "$nwo" "$item_path" "$item_ws"; then
+          item_ws=$WS_ENSURE_NEW   # REPOMAP already rewritten; retry once, claim held
+          continue
+        fi
+        # ensure_repo_workspace already set WS_ENSURE_ERR.
+      else
+        # Second workspace_not_found in the SAME launch, immediately after a
+        # successful recovery retry: the workspace we just resolved/created
+        # is already gone too. Unrecoverable, not transient - falling
+        # through to the generic transient branch here reopens issue #19:
+        # the board would claim and release this repo's issues forever,
+        # since WSDEAD never gets marked.
+        WS_ENSURE_ERR="tab create failed with workspace_not_found again for workspace $item_ws, immediately after a successful recovery to it"
       fi
       # Permanent, not transient: no workspace can be had for this repo.
       log "issue #$num: board $CUR_NAME: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $item_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim released, no further claims for $nwo until this is fixed"
@@ -1419,8 +1451,7 @@ launch_issue() {
       board_release "$nwo" "$num"
       return 1
     fi
-    # Anything else - or a second workspace_not_found after a successful
-    # recovery - stays a transient launch failure, now carrying herdr's own
+    # Anything else stays a transient launch failure, carrying herdr's own
     # error code so "retry will fix this" is distinguishable at a glance.
     log "issue #$num: tab create failed${err_code:+ ($err_code)}: $create_json"
     report "issue #$num could not start: tab create failed${err_code:+ ($err_code)}. Claim released, issue back in rotation."
@@ -1572,9 +1603,11 @@ board_state_save() {
 # must not read as an idle board — so no departure diff, no claim, no
 # release, no launch happens on the failure path.
 service_board_cycle() {
-  # Repos skipped this cycle for want of a workspace: keeps the skip log to
-  # one line per repo instead of one per ready issue.
+  # Repos resolved (either way) this cycle for want of a workspace: keeps
+  # both the recovery attempt and the skip log to one per repo instead of
+  # one per ready issue (issue #19 M3).
   CYCLE_WS_SKIP=""
+  CYCLE_WS_OK=""
   if ! board_load; then
     log "board $CUR_NAME: in-flight fetch failed: $(cat "$ERRFILE")"
     return 1
@@ -1737,14 +1770,24 @@ service_board_cycle() {
       # claim at all: claiming an issue we cannot launch just releases it
       # again next cycle forever (issue #19), burning two label writes per
       # ready issue per cycle and leaving the board looking healthy. The
-      # retry inside board_repo_launchable is local herdr calls only, so
-      # this costs no GitHub call and self-heals without a restart.
-      if ! board_repo_launchable "$nwo"; then
-        if ! grep -qxF "$nwo" <<<"$CYCLE_WS_SKIP"; then
+      # retry inside board_repo_launchable does real herdr work (workspace
+      # list, a git rev-parse per candidate, maybe workspace create), so
+      # CYCLE_WS_SKIP/CYCLE_WS_OK are checked FIRST, before ever calling it
+      # again for this repo this cycle: a dead repo with N ready issues
+      # attempts recovery once per cycle, not N times, and once recovered
+      # this cycle the remaining ready issues fall straight through to the
+      # claim below without re-attempting recovery.
+      if grep -qxF "$nwo" <<<"$CYCLE_WS_SKIP"; then
+        continue
+      fi
+      if ! grep -qxF "$nwo" <<<"$CYCLE_WS_OK"; then
+        if board_repo_launchable "$nwo"; then
+          CYCLE_WS_OK=$(printf '%s\n%s' "$CYCLE_WS_OK" "$nwo")
+        else
           CYCLE_WS_SKIP=$(printf '%s\n%s' "$CYCLE_WS_SKIP" "$nwo")
           log "board $CUR_NAME: no usable herdr workspace for $nwo ($WS_ENSURE_ERR), not claiming its issues this cycle"
+          continue
         fi
-        continue
       fi
       if ! board_claim "$nwo" "$num"; then
         log "issue #$num: claim failed (raced?), skipping"
@@ -1854,6 +1897,7 @@ while true; do
   # apart from those insertions.
   CYCLE_SEEN=""
   CYCLE_WS_SKIP=""
+  CYCLE_WS_OK=""
   b=0
   while [ "$b" -lt "$NBOARDS" ]; do
     bv "$b" PREV_INFLIGHT
