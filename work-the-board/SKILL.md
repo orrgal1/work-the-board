@@ -189,11 +189,18 @@ issue — a visible tab and agent the operator can watch and steer, not a hidden
 subagent:
 
 ```bash
-herdr tab create --workspace <WORKSPACE_ID> --no-focus
+herdr tab create --workspace <WORKSPACE_ID> --cwd <BOARD_PATH> --no-focus
 herdr agent start <name> --kind omp --pane <PANE_ID>
 herdr tab rename <TAB_ID> "op: <short description>"
 herdr agent prompt <name> "<operator's request, verbatim>"
 ```
+
+`<WORKSPACE_ID>` stays this session's own workspace, so the op tab sits beside the board
+tab; `<BOARD_PATH>` is the target repo's checkout — `path` in the config for a `repo`
+board, the mapped repo's `repos[]` entry for a `project` board, or `<project dir>` for a
+single positional board — the same directory issue tabs already land in via
+`--cwd "$item_path"`, so the operation pane opens in the repo it operates on instead of
+wherever this board session happens to be running.
 
 Name it so it can't collide with an issue agent (`<board>-issue-<N>`) — e.g.
 `<board>-op-<short-slug>`. Do not `--wait` on the prompt; that would block this session's
