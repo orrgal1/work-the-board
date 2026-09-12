@@ -1741,7 +1741,7 @@ board_repo_launchable() {   # <nwo>
 # issue. Releases the claim and cleans up the tab if anything fails.
 launch_issue() {
   local nwo="$1" num="$2" title="$3"
-  local name create_json pane tab start_out attempt prompt err_code ws_retry
+  local name create_json pane tab start_out start_out_report attempt prompt err_code ws_retry
   local pr_info pr_num pr_branch adopt branch_only item_path item_ws orig_ws
 
   # Cross-repo dispatch: every downstream call for this item — the tab and
@@ -1853,10 +1853,14 @@ launch_issue() {
     # Collapsed and bounded for the operator report only (review #20 MN3):
     # $start_out is herdr's raw, possibly multi-line/arbitrary-length stderr
     # capture, and an empty capture must not render as a bare trailing
-    # "start_out_report" collapses it to one line so it slots cleanly mid
-    # sentence; the untruncated original is already in the log line above.
+    # colon. start_out_report collapses it to one line so it slots cleanly
+    # mid sentence, truncates it with a marker so the operator can tell
+    # there is more in the log, and substitutes a placeholder when empty;
+    # the untruncated original is already in the log line above.
     start_out_report=${start_out//$'\n'/ }
-    start_out_report=${start_out_report:0:300}
+    if [ "${#start_out_report}" -gt 300 ]; then
+      start_out_report="${start_out_report:0:300}…"
+    fi
     [ -z "$start_out_report" ] && start_out_report="(herdr reported no error output)"
     report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closed and claim released, issue back in rotation."
     herdr tab close "$tab" >/dev/null 2>&1
@@ -2196,7 +2200,7 @@ service_board_cycle() {
         if ! agent_busy "$CUR_IDX" "$nwo#$num"; then
           agent_busy_mark "$CUR_IDX" "$nwo#$num"
           log "issue #$num: agent $agent_name is already live; skipping without claiming"
-          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue; on a multi-repo project board it can instead be another repo's issue #$num sharing the same board+number. The watcher will not free this on its own while the issue stays open: close that agent's tab, or run herdr agent stop $agent_name, to release the name and let this issue launch on a later cycle."
+          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue; on a multi-repo project board it can instead be another repo's issue #$num sharing the same board+number. The watcher will not free this on its own while the issue stays open: run herdr agent rename $agent_name --clear to free the name without disturbing that session, or close its tab if it is genuinely finished, then this issue will launch on a later cycle."
         else
           log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
         fi
