@@ -225,10 +225,11 @@ After relaying a report, check `herdr pane get <PANE_ID>`:
 A report is routinely sent from inside the op agent's own turn, so `agent_status` can still
 read `working` the instant after you relay it — that is not proof the operation is done.
 Re-check every op tab this rule left open on the next report, the next operator turn, and
-unconditionally at Stop (below); close it the first time its status reads `idle`/`done`.
+unconditionally at Stop (below); close it the first time its status reads `idle`/`done` —
+or orphaned, per the table above.
 Never close a tab that reads `working` or `blocked` — `blocked` means the operator hasn't
 answered it yet, not that the operation is finished.
 
 ## 7. Stop
 
-Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so an issue tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`. Any `op:` tab still open at this point is this session's own to close (see Op-tab teardown in step 6): close it now unless `herdr pane get <PANE_ID>` still reads `working` or `blocked`.
+Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so an issue tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`. Any `op:` tab still open at this point is this session's own to close (see Op-tab teardown in step 6): close it now unless `herdr pane get <PANE_ID>` still reads `working` or `blocked` — name any tab left open for that reason as still running in the stop report so the operator knows it's theirs to steer or close from here.
