@@ -7,7 +7,7 @@ description: "Continuously watch the GitHub issue board and keep a fixed number 
 
 Keep a fixed count of issues in flight, hands-off: poll the board, select and claim ready issues yourself, and hand each one to a `next-issue` session.
 
-**This session leads; it never builds.** Never work an issue here, and never fan issues out to `task` subagents — that bypasses the worktree/tab/PR lifecycle `next-issue` owns, hides the work from the operator, and leaves nobody able to take "ready"/"land" instructions for it.
+**This session leads; it never builds, and it never does other work itself either.** Never work an issue here, and never fan issues out to `task` subagents — that bypasses the worktree/tab/PR lifecycle `next-issue` owns, hides the work from the operator, and leaves nobody able to take "ready"/"land" instructions for it. The operator can also type anything else into this tab while the watcher runs — a bug, a feature, research, an in-place operation — route it per "Route other operator input" below instead of acting on it here.
 
 ## 1. Get concurrency and mode
 
@@ -162,6 +162,44 @@ A pane stuck at `agent_status: "unknown"` with no session file means the launch 
 
 `ready=0` with everything genuinely blocked or claimed is the correct steady state: report that as-is rather than forcing work.
 
-## 6. Stop
+## 6. Route other operator input
+
+`ready`, `land`, and `done` are never typed here — those go in the issue's own tab, and the
+board session never sees them. Anything else the operator sends this tab, at any point
+while the watcher runs, is either issue-worthy work, research, or a one-off operation.
+Classify it before acting; never run it in this pane:
+
+| Input | Meaning | Action |
+|---|---|---|
+| Bug, feature, or anything else that resolves as a diff | Issue-worthy | Run `new-issue` inline, right now, in this session |
+| Resolves by a human deciding, approving, or registering something — not a diff | Research | Run `new-issue` the same way; it lands with the `research` label, so the watcher leaves it alone |
+| No diff to land at all — restart a local deployment, run a DB query, tail a log, poke a running service | Operation | Launch a fresh session for it (below); never run it here |
+
+Filing an issue or research item this way is bookkeeping, not work — it costs this
+session nothing and needs no session of its own.
+
+**Several boards configured:** file against the board the request plainly belongs to (by
+repo, path, or explicit operator naming); ask which board only when it is genuinely
+ambiguous. `new-issue`'s own `gh` commands run unscoped, so `cd` into that board's `path`
+(or pass `--repo <owner/repo>`) before running them.
+
+**Launching an operation session.** Running the operation here blocks this pane and stalls
+report delivery from the watcher, so hand it off the same way the watcher hands off an
+issue — a visible tab and agent the operator can watch and steer, not a hidden `task`
+subagent:
+
+```bash
+herdr tab create --workspace <WORKSPACE_ID> --no-focus
+herdr agent start <name> --kind omp --pane <PANE_ID>
+herdr tab rename <TAB_ID> "op: <short description>"
+herdr agent prompt <name> "<operator's request, verbatim>"
+```
+
+Name it so it can't collide with an issue agent (`<board>-issue-<N>`) — e.g.
+`<board>-op-<short-slug>`. Do not `--wait` on the prompt; that would block this session's
+own loop. Relay whatever the operation session reports back to the operator when it
+arrives.
+
+## 7. Stop
 
 Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so a tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`.
