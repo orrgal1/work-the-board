@@ -130,21 +130,28 @@ run regardless of which case applies.
 true for both a watcher-launched session and the ordinary human-started standalone
 session. Nothing herdr-specific is needed: just record `<new checkout path>`, root every
 subsequent read/edit/command there (see step 4), and rename the tab you are already
-running in — no new tab, no new workspace. Use the convention matching how this session
-started:
+running in — no new tab, no new workspace. Which form to use is not a guess: a
+watcher-launched session's own herdr agent is named `<board>-issue-<N>` (see "Handed a
+tab by `work-the-board`?" above), so look yourself up in `herdr agent list` by `tab_id`
+(`$HERDR_TAB_ID`) or `pane_id` (`$HERDR_PANE_ID`) and read back its `name`. A name of that
+shape for *this* issue number names the board — use it in the prefixed form below. A name
+that does not match (a plain human-started session with no launching board) means there
+is no board to name, and the bare form is correct.
 
 ```bash
-# Watcher-launched session: use the board's tab convention
+# Watcher-launched session: <board> comes from this session's own agent name above,
+# never guessed or left blank
 herdr tab rename "$HERDR_TAB_ID" "<board>/issue-<N>: <title>"
 
-# Standalone session: use the bare form
+# Standalone session (no board found above): use the bare form
 herdr tab rename "$HERDR_TAB_ID" "issue-<N>: <TITLE>"
 ```
 
-Get this right the first time: a tab left in the bare form is invisible to the watcher's
-`sweep_finished_tabs` (it only matches `<board>/issue-<N>:`), and a tab in a primary
-workspace is unreachable by `sweep_orphan_worktrees` either way — exactly the
-label-matching failure this skill exists to avoid.
+Get this right the first time: a tab left in the bare form when a board does own this
+session is invisible to that board's watcher `sweep_finished_tabs` (it only matches
+`<board>/issue-<N>:`), and a tab in a primary workspace is unreachable by
+`sweep_orphan_worktrees` either way — exactly the label-matching failure this skill
+exists to avoid.
 
 **Rare fallback — your pane is NOT already inside the target repo's own workspace.**
 Check this first, before any tab action: compare `$HERDR_WORKSPACE_ID` against the
@@ -170,9 +177,16 @@ herdr pane move "$HERDR_PANE_ID" --workspace <repo_workspace_id> --new-tab --no-
 ```
 
 Then immediately re-apply the tab label from the move's own response — do this in the
-same breath, before anything else:
+same breath, before anything else, using the same board-or-bare determination as the
+common case above (look up this session's own agent `name` via `herdr agent list`
+before the move; the move itself does not change it):
 
 ```bash
+# Watcher-launched session: same canonical form and same `<board>` source as the
+# common case
+herdr tab rename <new-tab-id-from-move-result> "<board>/issue-<N>: <title>"
+
+# Standalone session (no board found above): use the bare form
 herdr tab rename <new-tab-id-from-move-result> "issue-<N>: <TITLE>"
 ```
 
