@@ -59,23 +59,41 @@ of `main`, same as before — only the mechanism changed, not the branch-selecti
 git -C <primary checkout path> worktree add <new checkout path> <existing-branch>
 ```
 
-Immediately after either command above, verify the new worktree actually belongs to
-this repo before doing anything else with it — worktree-creation tooling has misplaced
-a worktree under an entirely different repo's tree before, and blindly trusting the
-result is exactly the failure mode to avoid:
+Immediately after either `worktree add` command above, verify the new worktree is
+actually parented to this repo before doing anything else with it. The real risk with
+plain `git worktree add` is not the command itself but a wrong `<primary checkout
+path>` — most likely when the pane is not yet in this repo's own workspace (the rare
+fallback below) and the command silently runs against whatever repo the pane actually
+sits in:
 
 ```bash
-git -C <new checkout path> remote get-url origin
+git -C <new checkout path> rev-parse --path-format=absolute --git-common-dir
+git -C <primary checkout path> rev-parse --path-format=absolute --git-common-dir
 ```
 
-Confirm that URL matches this repo's own remote, and that `<new checkout path>` sits
-under this repo's own worktree root, not some other project's. On any mismatch, the
-worktree belongs to the wrong repo: remove it (`git -C <primary checkout path> worktree
-remove <new checkout path>`), re-create it, and report the misplacement — never
-proceed with it, and never commit, push, or file anything against it.
+Both must print the identical absolute path (plain `--git-common-dir` without
+`--path-format=absolute` can print one side relative and the other absolute even when
+they agree, which looks like a mismatch when it is not — always pass the flag). Treat
+a real mismatch, and treat either command failing outright (a half-created worktree
+resolves neither), as the same verdict: this worktree does not belong to this repo.
+Do not proceed with it, and do not commit,
+push, or file anything against it. Remove it by addressing the worktree itself, not
+the assumed primary — this resolves the owning repo through the worktree's own gitfile
+and works even when the worktree turned out to be parented to a different repo
+entirely:
+
+```bash
+git -C <new checkout path> worktree remove <new checkout path>
+```
+
+If that itself fails because the path isn't a worktree at all (creation failed
+outright), delete the directory and run `git worktree prune` in whichever repo's
+`worktree list` still references it. Then re-create against the corrected primary
+checkout path and report the misplacement. If the corrected re-creation fails the same
+check again, stop and report — do not loop on repeated remove/re-create attempts.
 
 **Never repair a misplaced worktree by rewriting its remote.** `git remote set-url`,
-`git remote add`, and similar are NEVER valid repairs here, because a worktree shares
+`git remote add`, and similar are never valid repairs here, because a worktree shares
 its parent repository's `.git/config` — "fixing" the origin on a misplaced worktree
 actually rewrites the *primary* checkout's origin instead, and a following fetch can
 pull a foreign repo's refs into it (this has happened: it moved a primary checkout's
@@ -83,9 +101,9 @@ pull a foreign repo's refs into it (this has happened: it moved a primary checko
 remove and re-create.
 
 Before touching any tab, decide which of the two cases below applies — that decision is
-conceptually the first thing to do, ahead of any tab action, though the `git worktree add`
-commands above are location-independent and may already have run regardless of which case
-applies.
+conceptually the first thing to do, ahead of any tab action, though the two `worktree
+add` commands at the top of this step are location-independent and may already have
+run regardless of which case applies.
 
 **Common case — your pane is already inside the target repo's own workspace.** This is
 true for both a watcher-launched session and the ordinary human-started standalone
