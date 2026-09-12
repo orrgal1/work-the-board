@@ -1850,7 +1850,15 @@ launch_issue() {
   done
   if [ "$attempt" -ge 10 ]; then
     log "issue #$num: agent start failed on pane $pane, closing tab $tab and releasing claim: $start_out"
-    report "issue #$num could not start: agent start failed on pane $pane: $start_out. Tab closed and claim released, issue back in rotation."
+    # Collapsed and bounded for the operator report only (review #20 MN3):
+    # $start_out is herdr's raw, possibly multi-line/arbitrary-length stderr
+    # capture, and an empty capture must not render as a bare trailing
+    # "start_out_report" collapses it to one line so it slots cleanly mid
+    # sentence; the untruncated original is already in the log line above.
+    start_out_report=${start_out//$'\n'/ }
+    start_out_report=${start_out_report:0:300}
+    [ -z "$start_out_report" ] && start_out_report="(herdr reported no error output)"
+    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closed and claim released, issue back in rotation."
     herdr tab close "$tab" >/dev/null 2>&1
     board_release "$nwo" "$num"
     return 1
@@ -2122,21 +2130,33 @@ service_board_cycle() {
 
   if [ "$launch" -gt 0 ]; then
     launched=0
-    # One `herdr agent list` call up front, reused for every ready row
-    # below (see the agent_busy* check just after the cross-board dedupe):
-    # rules out relaunching an issue whose own launch-target agent name is
-    # still live from a prior session that has not exited yet (#20). A
-    # failure here is NOT fatal to this cycle's launches — it just means
-    # this cycle runs without that extra guard, exactly like every cycle
-    # before #20, so a transient herdr hiccup here costs at most one
-    # ordinary agent-start-failure-and-release, never a new stuck loop.
+    # One `herdr agent list` call per board per cycle, reused for every
+    # ready row below (see the agent_busy* check just after the
+    # cross-board dedupe): rules out relaunching an issue whose own
+    # launch-target agent name is still live from a prior session that
+    # has not exited yet (#20). agent_list_ok carries the fetch outcome
+    # explicitly rather than being inferred from live_agent_names being
+    # empty (review #20 MJ1): "fetch succeeded, zero live agents" and
+    # "fetch failed" are both empty-string cases and must not be
+    # conflated, or a failed fetch reads as proof no agent is live and
+    # wrongly clears every currently-latched agent_busy mark below,
+    # re-arming the report and the claim/release churn on every flap. A
+    # failed fetch is NOT fatal to this cycle's launches — it just means
+    # this cycle runs without the extra guard, exactly like every cycle
+    # before #20, so one bad fetch costs at most one ordinary
+    # agent-start-failure-and-release, never a new stuck loop.
     agent_list_out=$(herdr agent list 2>/dev/null)
     agent_list_rc=$?
+    agent_list_ok=0
     live_agent_names=""
     if [ "$agent_list_rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$agent_list_out"; then
+      agent_list_ok=1
       live_agent_names=$(jq -r '.result.agents[]? | (.name // "")' <<<"$agent_list_out")
     else
       log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — launching this cycle without the already-live-agent check"
+      if skip_once "agent-list-failed-launch-gate"; then
+        report "herdr agent list failed or returned invalid JSON — launching without the check that skips relaunching an issue whose own agent is still live (#20's guard). If this repeats, the old per-cycle claim/release loop for such an issue can recur; a transient herdr fault is the likely cause."
+      fi
     fi
     while IFS=$'\t' read -r nwo num title; do
       [ "$launched" -ge "$launch" ] && break
@@ -2151,27 +2171,40 @@ service_board_cycle() {
       fi
       # An issue whose own launch-target agent name — "$CUR_NAME-issue-$num",
       # built identically to launch_issue's own $name — is still a live
-      # herdr agent means a prior session for THIS issue has not exited
-      # (it landed and the issue reopened, or it is simply still running).
-      # herdr agent names are global and unique, so claiming and launching
-      # into a name that is still taken only fails agent start, releases
-      # the claim, and re-claims it again next cycle forever (#20). Skip
-      # WITHOUT claiming instead. agent_busy latches the operator report to
-      # once per occurrence rather than every cycle, and is cleared below
-      # once the name is no longer live, so a later, genuinely new
-      # occurrence of the same issue number still gets reported.
+      # herdr agent means a session holding that exact name has not
+      # exited (normally this issue's own prior session; on a project
+      # board spanning repos the same board+number can instead belong to
+      # another repo's issue #$num, since the name is not repo-qualified
+      # — the report below hedges accordingly, review #20 MN2). herdr
+      # agent names are global and unique, so claiming and launching into
+      # a name that is still taken only fails agent start, releases the
+      # claim, and re-claims it again next cycle forever (#20). Skip
+      # WITHOUT claiming instead, and also fold this row into CYCLE_SEEN
+      # (review #20 MJ2): otherwise a sibling board sharing this repo
+      # sees the issue as un-owned (it is by definition not mgr:in-flight
+      # here — its prior session already dropped that on landing) and
+      # launches a second, concurrent session under its OWN board-name on
+      # the same issue and worktree. agent_busy latches the operator
+      # report to once per occurrence rather than every cycle — gated on
+      # agent_list_ok so a failed fetch (empty live_agent_names for the
+      # wrong reason) can never look like a match — and is cleared below
+      # once a successful fetch no longer finds the name live, so a
+      # later, genuinely new occurrence of the same issue still reports.
       agent_name="$CUR_NAME-issue-$num"
-      if [ -n "$live_agent_names" ] && grep -qxF "$agent_name" <<<"$live_agent_names"; then
+      if [ "$agent_list_ok" -eq 1 ] && grep -qxF "$agent_name" <<<"$live_agent_names"; then
+        CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
         if ! agent_busy "$CUR_IDX" "$nwo#$num"; then
           agent_busy_mark "$CUR_IDX" "$nwo#$num"
           log "issue #$num: agent $agent_name is already live; skipping without claiming"
-          report "issue #$num: already owned by a live session - its agent ($agent_name) is still running, most likely from a prior landing that has not exited yet. Skipped without claiming, not relaunched; it will be picked up automatically once that session exits."
+          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue; on a multi-repo project board it can instead be another repo's issue #$num sharing the same board+number. The watcher will not free this on its own while the issue stays open: close that agent's tab, or run herdr agent stop $agent_name, to release the name and let this issue launch on a later cycle."
         else
           log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
         fi
         continue
       fi
-      agent_busy "$CUR_IDX" "$nwo#$num" && agent_busy_clear "$CUR_IDX" "$nwo#$num"
+      if [ "$agent_list_ok" -eq 1 ]; then
+        agent_busy "$CUR_IDX" "$nwo#$num" && agent_busy_clear "$CUR_IDX" "$nwo#$num"
+      fi
       # A repo whose workspace is gone and cannot be re-established gets no
       # claim at all: claiming an issue we cannot launch just releases it
       # again next cycle forever (issue #19), burning two label writes per
