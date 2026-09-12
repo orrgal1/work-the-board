@@ -61,22 +61,32 @@ git -C <primary checkout path> worktree add <new checkout path> <existing-branch
 
 Immediately after either `worktree add` command above, verify the new worktree is
 actually parented to this repo before doing anything else with it. The real risk with
-plain `git worktree add` is not the command itself but a wrong `<primary checkout
-path>` — most likely when the pane is not yet in this repo's own workspace (the rare
-fallback below) and the command silently runs against whatever repo the pane actually
-sits in:
+plain `git worktree add` is a wrong `<primary checkout path>` — most likely when the
+pane is not yet in this repo's own workspace (the rare fallback below) — so the check
+must not itself depend on `<primary checkout path>`: comparing the new worktree back
+against the very value that built it never catches that value being wrong. Anchor
+instead on the repo identity you already know independently — the one you were told
+to work on (a board's configured `repo`, or the directory the operator pointed you
+at), never anything re-derived from a git command run inside a checkout:
 
 ```bash
-git -C <new checkout path> rev-parse --path-format=absolute --git-common-dir
-git -C <primary checkout path> rev-parse --path-format=absolute --git-common-dir
+git -C <new checkout path> remote get-url origin
 ```
 
-Both must print the identical absolute path (plain `--git-common-dir` without
-`--path-format=absolute` can print one side relative and the other absolute even when
-they agree, which looks like a mismatch when it is not — always pass the flag). Treat
-a real mismatch, and treat either command failing outright (a half-created worktree
-resolves neither), as the same verdict: this worktree does not belong to this repo.
-Do not proceed with it, and do not commit,
+A worktree shares its parent checkout's `.git/config`, so this origin names the
+*parent* repo — confirm it matches the repo you were told to work on, not some other
+repo the pane happened to be sitting in. Separately, confirm the path is a worktree
+root and not merely a directory nested inside one (upward directory discovery would
+otherwise let a stray leftover subdirectory pass the origin check too, since it
+inherits the same repo identity):
+
+```bash
+test "$(git -C <new checkout path> rev-parse --path-format=absolute --show-toplevel)" = "$(cd <new checkout path> && pwd -P)"
+```
+
+Treat a failed origin match, a failed toplevel match, or either command failing
+outright (a half-created worktree satisfies neither), as the same verdict: this
+worktree does not belong to this repo. Do not proceed with it, and do not commit,
 push, or file anything against it. Remove it by addressing the worktree itself, not
 the assumed primary — this resolves the owning repo through the worktree's own gitfile
 and works even when the worktree turned out to be parented to a different repo
