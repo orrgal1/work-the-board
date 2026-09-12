@@ -28,7 +28,7 @@ when the board is full or nothing is ready. Only `mgr:in-flight` consumes a slot
 stale claim costs you capacity until it is cleared. Changing the limit means restarting
 the watcher; already-running sessions keep going.
 
-**Several boards, one process.** Pass `--config <file>` instead of the positional args to run several boards — independent repos, a Projects v2 board that spans repos, or a mix — from one watcher. Concurrency is set per board with no global cap; a project board's `repos` array lets it dispatch each item into its own repo's checkout and workspace. Minimal two-board example:
+**Several boards, one process.** Pass `--config <file>` instead of the positional args to run several boards — independent repos, a Projects v2 board that spans repos, or a mix — from one watcher. Concurrency is set per board with no global cap; a project board's `repos` array lets it dispatch each item into that repo's own checkout and its own configured `workspace` (never the board-watcher session's own workspace). A board's `workspace` must be that repo's own primary herdr workspace — its checkout equal to `path`, and not itself a linked-worktree workspace — which the watcher now validates at startup. Minimal two-board example:
 
 ```json
 { "boards": [
