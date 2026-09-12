@@ -111,6 +111,15 @@ pull a foreign repo's refs into it (this has happened: it moved a primary checko
 `origin/main` to a different project's history entirely). The only valid repair is
 remove and re-create.
 
+The worktree verified, take two records now, before any implementation work, whichever tab case below applies:
+
+```bash
+realpath <new checkout path>                        # the absolute worktree path every subagent brief will carry
+git -C <primary checkout path> status --porcelain   # the primary checkout's pre-existing dirt — the baseline
+```
+
+Record `<new checkout path>` absolute because step 4 forbids relative paths in subagent briefs. The baseline is what "clean" means for this session: whatever it lists now was there before this session started and is not yours to touch — or to clean up. See "Leave the primary checkout as you found it" below.
+
 Before touching any tab, decide which of the two cases below applies — that decision is
 conceptually the first thing to do, ahead of any tab action, though the two `worktree
 add` commands at the top of this step are location-independent and may already have
@@ -188,6 +197,27 @@ gh pr create --draft --fill --head issue-<N>-<slug> --base main --body "Closes #
 Every read, edit, and command for this issue runs rooted at the worktree path — never
 the primary checkout. Do not touch files outside it. Do not merge or close anything yet.
 
+Subagents are where this rule breaks: a relative path in a subagent's tool call resolves against this session's base cwd — the primary checkout — not against whatever worktree its brief names. Twice this has written superseded drafts into a primary checkout and blocked its next `git pull --ff-only` there. So every subagent brief — builder, plan, or review — states the worktree as the absolute path recorded in step 2 and requires absolute paths in every file operation it hands out; a brief that names the worktree but passes relative paths is a bug, however clear its intent.
+
+When a subagent's first result comes back, confirm one file it claims to have written actually exists under `<new checkout path>` before building on it — a leak caught at the first slice costs one `read`; caught at the finish line it costs a re-run.
+
+## Leave the primary checkout as you found it
+
+The finish line for this session is any of: a supervised stop-and-report after pushing, closing the issue (landing in step 6, or abandoning in step 7), and removing the worktree in step 7. Before each, re-run the baseline command from step 2 and compare:
+
+```bash
+git -C <primary checkout path> status --porcelain
+```
+
+Every entry already in the baseline is pre-existing local state — someone's intentional edits, nothing to do with this issue. Leave it alone. Every path NOT in the baseline is this session's leak (see step 4). Restore each one by its exact path, and only those:
+
+```bash
+git -C <primary checkout path> checkout -- <path>    # tracked file modified or deleted
+rm <primary checkout path>/<path>                     # untracked file that appeared
+```
+
+Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the primary checkout: the baseline can hold intentional local edits unrelated to any issue (it has), and a blanket restore destroys them. A path that is in the baseline but that this session may also have written to cannot be restored safely either — leave it and name it in the report instead. Name every path restored (or left, per the previous sentence) in the final report; a comparison showing nothing new needs no more than that it passed.
+
 ## 5. On "ready"
 
 Only when explicitly instructed:
@@ -201,7 +231,7 @@ or trigger the workflow if it doesn't run automatically); if unavailable, say so
 
 ## 6. On "land"
 
-Only when explicitly instructed:
+Only when explicitly instructed, and after the primary-checkout comparison ("Leave the primary checkout as you found it") has run since the last file operation:
 
 ```bash
 gh pr merge <PR_N> --squash --delete-branch
@@ -218,7 +248,9 @@ Confirm the merge succeeded (`gh pr view <PR_N> --json state`) before closing th
 
 Only when explicitly instructed, and only after landing (or after being told to abandon
 the issue without landing — in that case remove `mgr:in-flight` and leave the issue open
-with a comment explaining why, before proceeding):
+with a comment explaining why, before proceeding), and after running the primary-checkout
+comparison ("Leave the primary checkout as you found it") — this session's last chance to
+restore anything:
 
 ```bash
 cd <primary checkout path>
