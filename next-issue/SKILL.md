@@ -40,7 +40,7 @@ so say so plainly and let the operator set Status themselves.
 as already claimed, skip this step (verify it still carries `mgr:in-flight` in repo mode,
 or `In progress` in project mode) and go straight to step 2.
 
-**Handed a tab by `work-the-board`?** With multi-board configs the watcher names the tab `<board>/issue-<N>: <title>` and the agent `<board>-issue-<N>` — use those exact names rather than deriving `issue-<N>` yourself. A watcher-launched session is always started inside the target repo's own herdr workspace by the watcher itself, so it always hits the common case in step 2 below, never the fallback.
+**Handed a tab by `work-the-board`?** With multi-board configs the watcher names the tab `<board>/issue-<N>: <title>` and the agent `<board>-issue-<N>` — use those exact names rather than deriving `issue-<N>` yourself. A watcher-launched session should always start inside the target repo's own herdr workspace, so it should land in the common case in step 2 below — but trust the workspace check there over this expectation if the two disagree; do not assume the fallback can't apply to you.
 
 ## 2. Create the worktree and rename the tab
 
@@ -128,28 +128,47 @@ run regardless of which case applies.
 
 **Common case — your pane is already inside the target repo's own workspace.** This is
 true for both a watcher-launched session and the ordinary human-started standalone
-session. Nothing herdr-specific is needed: just record `<new checkout path>`, root every
-subsequent read/edit/command there (see step 4), and rename the tab you are already
-running in — no new tab, no new workspace. Which form to use is not a guess: a
-watcher-launched session's own herdr agent is named `<board>-issue-<N>` (see "Handed a
-tab by `work-the-board`?" above), so look yourself up in `herdr agent list` by `tab_id`
-(`$HERDR_TAB_ID`) or `pane_id` (`$HERDR_PANE_ID`) and read back its `name`. A name of that
-shape for *this* issue number names the board — use it in the prefixed form below. A name
-that does not match (a plain human-started session with no launching board) means there
-is no board to name, and the bare form is correct.
+session. No new tab and no new workspace are needed either way: just record `<new
+checkout path>`, root every subsequent read/edit/command there (see step 4), and rename
+the tab you are already running in.
+
+Which form to use is not a guess. A watcher-launched session's own herdr agent is named
+`<board>-issue-<N>` (see "Handed a tab by `work-the-board`?" above); look yourself up to
+read it back:
 
 ```bash
-# Watcher-launched session: <board> comes from this session's own agent name above,
+herdr agent list | jq -r --arg p "$HERDR_PANE_ID" --arg t "$HERDR_TAB_ID" \
+  '.result.agents[] | select(.pane_id == $p or .tab_id == $t) | .name'
+```
+
+- **Name ends `-issue-<number>`:** you are watcher-launched. `<board>` is that name with
+  the trailing `-issue-<number>` suffix stripped, whatever that number is — a relaunch or
+  an adopted/handed-off issue can carry a different number there than the one you are
+  working now, and the board name is still correct. Use the prefixed form below, labelled
+  with the issue number you are actually working.
+- **Name has no such suffix:** genuinely standalone, no board exists to name. Use the bare
+  form below.
+- **Lookup returns nothing, errors, or `herdr`/`jq` are unavailable:** unknown, not
+  standalone — do not guess bare. Check whether the tab already carries a canonical label
+  instead (`herdr tab list` for `$HERDR_TAB_ID`, or the label surfaced by the fallback's
+  own move below): a label already shaped `<board>/issue-<n>: ...` means a board launched
+  you, so reuse that `<board>` and update only the title/issue number. Only conclude
+  standalone, and use the bare form, if neither the agent lookup nor the existing label
+  yields a board; if it's genuinely unclear, stop and report rather than pick.
+
+```bash
+# Watcher-launched session: <board> comes from the self-lookup (or existing label) above,
 # never guessed or left blank
 herdr tab rename "$HERDR_TAB_ID" "<board>/issue-<N>: <title>"
 
-# Standalone session (no board found above): use the bare form
+# Standalone session (confirmed no board above): use the bare form
 herdr tab rename "$HERDR_TAB_ID" "issue-<N>: <TITLE>"
 ```
 
 Get this right the first time: a tab left in the bare form when a board does own this
 session is invisible to that board's watcher `sweep_finished_tabs` (it only matches
-`<board>/issue-<N>:`), and a tab in a primary workspace is unreachable by
+`<board>/issue-<N>:`, and only a lowercase/dash `<board>` at that — `watch.sh`'s own
+launch naming shares this constraint), and a tab in a primary workspace is unreachable by
 `sweep_orphan_worktrees` either way — exactly the label-matching failure this skill
 exists to avoid.
 
@@ -177,16 +196,17 @@ herdr pane move "$HERDR_PANE_ID" --workspace <repo_workspace_id> --new-tab --no-
 ```
 
 Then immediately re-apply the tab label from the move's own response — do this in the
-same breath, before anything else, using the same board-or-bare determination as the
-common case above (look up this session's own agent `name` via `herdr agent list`
-before the move; the move itself does not change it):
+same breath, before anything else, using the same self-lookup as the common case above
+(run it before the move: `$HERDR_PANE_ID` survives the move, `$HERDR_TAB_ID` does not, so
+look up by whichever you still trust, but do it now — the move itself does not change the
+agent's `name`):
 
 ```bash
-# Watcher-launched session: same canonical form and same `<board>` source as the
-# common case
+# Watcher-launched session: <board> = self agent name minus its trailing `-issue-<number>`
+# suffix (see common case above). Unknown/no-match still means stop and report, not bare.
 herdr tab rename <new-tab-id-from-move-result> "<board>/issue-<N>: <title>"
 
-# Standalone session (no board found above): use the bare form
+# Standalone session (confirmed no board above): use the bare form
 herdr tab rename <new-tab-id-from-move-result> "issue-<N>: <TITLE>"
 ```
 
@@ -283,8 +303,11 @@ Remove the worktree, then close the tab, in that order — a lingering tab looks
 live session. There is no separate worktree workspace to close: only the one tab this
 session has been running in the whole time (its id from the common case, or the
 move-result id from the fallback in step 2) needs closing. If unrecorded, `herdr tab
-list` and match the label prefix `issue-<N>:`. Never close the tab or remove the
-worktree before landing unless told to abandon the issue.
+list` and match against `^([a-z0-9-]+/)?issue-<N>:` — the same board-prefix-optional
+shape the watcher's own ownership checks use (`watch.sh`'s `agent_tab_owns_issue`), since
+a board-launched session's canonical label carries the `<board>/` prefix and a bare
+`issue-<N>:` search would miss it. Never close the tab or remove the worktree before
+landing unless told to abandon the issue.
 
 Note: `git worktree remove` addresses the checkout by its recorded `<checkout path>`,
 not by the session's live cwd, so the command itself does not care where it is run
