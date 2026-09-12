@@ -149,12 +149,15 @@ herdr agent list | jq -r --arg p "$HERDR_PANE_ID" --arg t "$HERDR_TAB_ID" \
 - **Name has no such suffix:** genuinely standalone, no board exists to name. Use the bare
   form below.
 - **Lookup returns nothing, errors, or `herdr`/`jq` are unavailable:** unknown, not
-  standalone — do not guess bare. Check whether the tab already carries a canonical label
-  instead (`herdr tab list` for `$HERDR_TAB_ID`, or the label surfaced by the fallback's
-  own move below): a label already shaped `<board>/issue-<n>: ...` means a board launched
-  you, so reuse that `<board>` and update only the title/issue number. Only conclude
-  standalone, and use the bare form, if neither the agent lookup nor the existing label
-  yields a board; if it's genuinely unclear, stop and report rather than pick.
+  standalone — a lookup that could not run is never evidence of "no board." Check
+  whether the tab already carries a canonical label instead: `herdr tab list` for
+  `$HERDR_TAB_ID` (in the fallback below, read this *before* the `pane move` — the Trap
+  after it means the post-move tab starts out with a bare number instead, not a usable
+  label). A label already shaped `<board>/issue-<n>: ...` means a board launched you, so
+  reuse that `<board>` and update only the title/issue number. Only a *successful*
+  lookup that found your own agent and showed no `-issue-<number>` suffix justifies the
+  bare form; if neither the lookup nor the existing label yields a board, stop and
+  report rather than pick.
 
 ```bash
 # Watcher-launched session: <board> comes from the self-lookup (or existing label) above,
