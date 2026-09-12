@@ -207,6 +207,16 @@ Name it so it can't collide with an issue agent (`<board>-issue-<N>`) — e.g.
 own loop. Relay whatever the operation session reports back to the operator when it
 arrives.
 
+**Op-tab teardown.** This session owns closing the op tab — it already holds the
+`<PANE_ID>`/`<TAB_ID>` from `herdr tab create`, and it is the agent that receives the
+report. Close the tab right after relaying that operation's report to the operator, and
+only then: check `herdr pane get <PANE_ID>` first, and close (`herdr tab close <TAB_ID>`)
+only when `agent_status` is no longer `working`. A report that arrives while the agent is
+still `working` is an interim update, not a finished operation — relay it and leave the
+tab open. The watcher's tab sweep never touches `op:`-labeled tabs (it only matches
+`<board>/issue-<N>:`), so skipping this step leaks the tab forever, exactly as raised in
+issue #9.
+
 ## 7. Stop
 
 Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so a tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`.
