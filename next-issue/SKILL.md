@@ -59,10 +59,62 @@ of `main`, same as before — only the mechanism changed, not the branch-selecti
 git -C <primary checkout path> worktree add <new checkout path> <existing-branch>
 ```
 
+Immediately after either `worktree add` command above, verify the new worktree is
+actually parented to this repo before doing anything else with it. The real risk with
+plain `git worktree add` is a wrong `<primary checkout path>` — most likely when the
+pane is not yet in this repo's own workspace (the rare fallback below) — so the check
+must not itself depend on `<primary checkout path>`: comparing the new worktree back
+against the very value that built it never catches that value being wrong. Anchor
+instead on the repo identity you already know independently — the one you were told
+to work on (a board's configured `repo`, or the directory the operator pointed you
+at), never re-derived from the possibly-wrong `<primary checkout path>` value you
+substituted into the add command above:
+
+```bash
+git -C <new checkout path> remote get-url origin
+```
+
+A worktree shares its parent checkout's `.git/config`, so this origin names the
+*parent* repo — confirm it matches the repo you were told to work on, not some other
+repo the pane happened to be sitting in. Separately, confirm the path is a worktree
+root and not merely a directory nested inside one (upward directory discovery would
+otherwise let a stray leftover subdirectory pass the origin check too, since it
+inherits the same repo identity):
+
+```bash
+test "$(git -C <new checkout path> rev-parse --path-format=absolute --show-toplevel)" = "$(cd <new checkout path> && pwd -P)"
+```
+
+Treat a failed origin match, a failed toplevel match, or either command failing
+outright (stranded outside any repo entirely), as the same verdict: this
+worktree does not belong to this repo. Do not proceed with it, and do not commit,
+push, or file anything against it. Remove it by addressing the worktree itself, not
+the assumed primary — this resolves the owning repo through the worktree's own gitfile
+and works even when the worktree turned out to be parented to a different repo
+entirely:
+
+```bash
+git -C <new checkout path> worktree remove <new checkout path>
+```
+
+If that itself fails because the path isn't a worktree at all (creation failed
+outright), delete the directory and run `git worktree prune` in whichever repo's
+`worktree list` still references it. Then re-create against the corrected primary
+checkout path and report the misplacement. If the corrected re-creation fails the same
+check again, stop and report — do not loop on repeated remove/re-create attempts.
+
+**Never repair a misplaced worktree by rewriting its remote.** `git remote set-url`,
+`git remote add`, and similar are never valid repairs here, because a worktree shares
+its parent repository's `.git/config` — "fixing" the origin on a misplaced worktree
+actually rewrites the *primary* checkout's origin instead, and a following fetch can
+pull a foreign repo's refs into it (this has happened: it moved a primary checkout's
+`origin/main` to a different project's history entirely). The only valid repair is
+remove and re-create.
+
 Before touching any tab, decide which of the two cases below applies — that decision is
-conceptually the first thing to do, ahead of any tab action, though the `git worktree add`
-commands above are location-independent and may already have run regardless of which case
-applies.
+conceptually the first thing to do, ahead of any tab action, though the two `worktree
+add` commands at the top of this step are location-independent and may already have
+run regardless of which case applies.
 
 **Common case — your pane is already inside the target repo's own workspace.** This is
 true for both a watcher-launched session and the ordinary human-started standalone
@@ -90,7 +142,10 @@ repo's own primary workspace id, found with the same reasoning `watch.sh`'s star
 validation uses — a workspace counts as the repo's own primary workspace when its
 checkout resolves to the repo's git root and it is not itself a linked worktree. The jq
 below does a plain string match, so resolve the canonical root first and substitute that
-(not a relative or symlinked path) for `<primary checkout path>`:
+(not a relative or symlinked path) for `<primary checkout path>`. The worktree guard
+above already ran before this point and validated `<primary checkout path>` against
+the worktree it produced, so this lookup is trusting a value that check has already
+covered, not a fresh unchecked one:
 
 ```bash
 primary_root=$(git -C <primary checkout path> rev-parse --show-toplevel)
@@ -167,7 +222,7 @@ with a comment explaining why, before proceeding):
 
 ```bash
 cd <primary checkout path>
-git -C <primary checkout path> worktree remove <checkout path>
+git -C <checkout path> worktree remove <checkout path>
 herdr tab close <TAB_ID>
 ```
 
