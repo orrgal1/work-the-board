@@ -985,7 +985,7 @@ launch_issue() {
   # after the tab is already created, leaving a real, visible, agent-less tab
   # with no cleanup. Verified against a live `herdr tab create` response; do not
   # change without re-checking the actual response shape.
-  create_json=$(herdr tab create --workspace "$item_ws" --no-focus 2>&1) || {
+  create_json=$(herdr tab create --workspace "$item_ws" --cwd "$item_path" --no-focus 2>&1) || {
     log "issue #$num: tab create failed: $create_json"
     report "issue #$num could not start: tab create failed. Claim released, issue back in rotation."
     board_release "$nwo" "$num"
