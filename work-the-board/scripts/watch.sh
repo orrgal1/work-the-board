@@ -499,7 +499,7 @@ resolve_primary_workspace() {   # <path>
   while IFS=$'\t' read -r id checkout linked; do
     [ -z "$id" ] && continue
     [ "$linked" = "false" ] || continue
-    root=$(repo_root_for "$checkout") || continue
+    root=$(repo_root_for "$checkout") || return 2
     [ "$root" = "$want" ] || continue
     printf '%s\n' "$id"
     return 0
@@ -1326,7 +1326,7 @@ WS_ENSURE_NEW=""
 WS_ENSURE_TRANSIENT=""
 ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   local nwo="$1" path="$2" old="$3" field found out new anchor linked rpw_rc
-  local new_checkout new_root want_root
+  local new_checkout new_root want_root adopted open_path
   WS_ENSURE_ERR=""
   WS_ENSURE_TRANSIENT=""
   field=$(repo_ws_field "$CUR_IDX" "$nwo")
@@ -1359,19 +1359,42 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   # an already-open path it returns the SAME existing workspace id instead
   # of forking one, so this call is safe even if resolve_primary_workspace
   # above raced a sibling board's own recovery.
-  out=$(herdr worktree open --cwd "$path" --path "$path" --label "$(basename "$path")" --no-focus 2>&1)
+  # Toplevel, not $path verbatim (#19 review round 3, MN1): a config
+  # `path` that is a subdirectory of the checkout root passes RCHECK and
+  # WSCHECK (both already resolve to the git toplevel), but `herdr
+  # worktree open --path <subdir>` itself fails with worktree_not_found -
+  # open the toplevel herdr already knows how to match, falling back to
+  # $path if it cannot be resolved so the error text below still names the
+  # operator's own configured path.
+  open_path=$(repo_root_for "$path" 2>/dev/null) || open_path=""
+  [ -n "$open_path" ] || open_path="$path"
+  out=$(herdr worktree open --cwd "$path" --path "$open_path" --label "$(basename "$path")" --no-focus 2>&1)
   new=$(jq -r '.result.workspace.workspace_id // empty' <<<"$out" 2>/dev/null)
   if [ -z "$new" ]; then
     WS_ENSURE_ERR="herdr worktree open --cwd $path failed: $out"
     return 1
   fi
+  # Idempotent per the comment above: a path already open under a live
+  # workspace comes back with already_open:true and THAT workspace's id
+  # instead of a freshly created one (#19 review round 3, B2) - live-
+  # verified that its .result.tab is then the workspace's CURRENTLY ACTIVE
+  # tab, not a new one, which may belong to a sibling board's or the
+  # operator's own running session. Everything below that assumes
+  # exclusive ownership (the anchor rename, closing on a failed check)
+  # must not run for this case: adopt it exactly like the
+  # resolve_primary_workspace hit above, never touch or destroy it.
+  adopted=$(jq -r '.result.already_open // empty' <<<"$out" 2>/dev/null)
   # Defensive: a path that BECAME a linked git worktree after startup would
   # give us a linked-worktree workspace, which sweep_orphan_worktrees is
   # entitled to reap. Only an explicit true fails; an absent field is fine.
   linked=$(jq -r '.result.workspace.worktree.is_linked_worktree // empty' <<<"$out" 2>/dev/null)
   if [ "$linked" = "true" ]; then
-    herdr workspace close "$new" >/dev/null 2>&1
-    WS_ENSURE_ERR="$path is a linked git worktree, not a primary checkout: herdr opened it as linked-worktree workspace $new (closed it before returning)"
+    if [ "$adopted" = "true" ]; then
+      WS_ENSURE_ERR="$path is a linked git worktree, not a primary checkout: herdr returned already-open linked-worktree workspace $new for it - left it untouched, this call does not own it"
+    else
+      herdr workspace close "$new" >/dev/null 2>&1
+      WS_ENSURE_ERR="$path is a linked git worktree, not a primary checkout: herdr opened it as linked-worktree workspace $new (closed it before returning)"
+    fi
     return 1
   fi
   # Post-condition (#19 review round 2, N6): `worktree open`'s response
@@ -1385,9 +1408,27 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   [ -n "$new_checkout" ] && new_root=$(repo_root_for "$new_checkout" 2>/dev/null)
   want_root=$(repo_root_for "$path" 2>/dev/null)
   if [ -z "$new_root" ] || [ -z "$want_root" ] || [ "$new_root" != "$want_root" ]; then
-    herdr workspace close "$new" >/dev/null 2>&1
-    WS_ENSURE_ERR="herdr worktree open --cwd $path returned workspace $new but its worktree.checkout_path (${new_checkout:-<none>}) does not resolve to $path's own git toplevel (closed it before returning)"
+    if [ "$adopted" = "true" ]; then
+      WS_ENSURE_ERR="herdr worktree open --cwd $path returned already-open workspace $new but its worktree.checkout_path (${new_checkout:-<none>}) does not resolve to $path's own git toplevel - left it untouched, this call does not own it, not creating a new one"
+    else
+      herdr workspace close "$new" >/dev/null 2>&1
+      WS_ENSURE_ERR="herdr worktree open --cwd $path returned workspace $new but its worktree.checkout_path (${new_checkout:-<none>}) does not resolve to $path's own git toplevel (closed it before returning)"
+    fi
     return 1
+  fi
+  if [ "$adopted" = "true" ]; then
+    # Converges with the resolve_primary_workspace hit above rather than
+    # the fresh-create path below: herdr found the same live workspace the
+    # resolver should have (a transient worktree:null read, a per-candidate
+    # repo_root_for failure, or a race with a sibling board's own recovery
+    # can all make the resolver miss it). It already has its own tabs -
+    # possibly a live session's - so no anchor rename, no ownership claim.
+    repo_set_workspace "$CUR_IDX" "$nwo" "$new" "$old"
+    log "board $CUR_NAME: config field $field workspace $old no longer exists; adopted live primary workspace $new for $path"
+    if skip_once "ws-recovered:$nwo"; then
+      report "config fault, recovered for this run: $field is workspace $old, which no longer exists - herdr destroys a workspace when its last tab closes. Launches for $nwo now use $new, this repo's own live primary workspace for $path. Set $field to $new in the config: a restart still exits 2 on the stale id."
+    fi
+    WS_ENSURE_NEW="$new"; return 0
   fi
   anchor=$(jq -r '.result.tab.tab_id // empty' <<<"$out" 2>/dev/null)
   # herdr's `worktree open` returns .result.workspace (workspace_id plus
@@ -1479,13 +1520,20 @@ launch_issue() {
       fi
       if [ "$WS_ENSURE_TRANSIENT" = "1" ]; then
         # rc 2 from resolve_primary_workspace (#19 review round 2, N5):
-        # "could not determine" is a transient herdr/git hiccup, not proof
-        # the workspace is gone. Still fail closed on claiming (ws_dead_mark
-        # + release below), but the operator-facing wording must not read
-        # as a permanent config fault - it self-heals next cycle's gate.
-        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path looks transiently unreachable, not confirmed gone: $WS_ENSURE_ERR; claim released, retrying automatically"
-        if skip_once "ws-broken:$nwo"; then
-          report "transient herdr issue, NOT a config fault: could not confirm whether $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path still exists this cycle ($WS_ENSURE_ERR). Issue #$num's claim was released; the board retries the check locally on its own next cycle, no config change needed unless this persists."
+        # this branch is only reached after herdr's own workspace_not_found
+        # already confirmed $orig_ws is gone - the "could not determine"
+        # uncertainty is about whether a REPLACEMENT could be resolved this
+        # cycle, not about whether the configured workspace still exists.
+        # Still fail closed on claiming (ws_dead_mark + release below), but
+        # the wording must say what is actually known: gone, not "not
+        # confirmed gone" (#19 review round 3, MJ2). The latch key is also
+        # its own now, not shared with the permanent-fault branch below
+        # (#19 review round 3, MJ1): a shared key meant the first transient
+        # blip on a repo silently swallowed every later genuine break
+        # report for it, since skip_once never clears.
+        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; claim released, retrying automatically"
+        if skip_once "ws-transient:$nwo"; then
+          report "workspace gone, replacement not yet resolved: herdr confirmed $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path no longer exists, but a replacement could not be resolved for $nwo this cycle, likely a transient herdr/git hiccup ($WS_ENSURE_ERR). Issue #$num's claim was released; the board retries the check locally on its own next cycle. If this repeats, update $(repo_ws_field "$CUR_IDX" "$nwo") to a workspace that is $item_path's own live primary workspace."
         fi
       else
         # Permanent, not transient: no workspace can be had for this repo.

@@ -107,10 +107,14 @@ the launch — then reports the fault once per (board, repo), naming the board a
 field (`workspace`, or `repos[<k>].workspace`) and the new id. **The config file is never
 rewritten**: the runtime id is authoritative only for that run, and startup validation still exits
 2 on the stale id, so update the field when you see that report. If no workspace can be
-established either — usually `path` itself is gone — the watcher reports it as a config fault, not
-a transient failure, releases the claim, and **stops claiming issues for that repo entirely**
-(rather than claiming and releasing one every cycle); it retries locally each cycle and resumes on
-its own once the path has a usable workspace.
+established either, the watcher reports one of two things depending on why. When herdr confirms
+the configured workspace is gone but a replacement could not be resolved this cycle — a transient
+herdr/git hiccup — it reports that as a transient issue, not a config fault, and expects the next
+cycle's local retry to resolve it on its own. When it is a genuine, repeatable fault — usually
+`path` itself is gone or no longer resolves to a usable checkout — it reports a config fault
+instead, naming the field to update. Either way the claim is released and the watcher **stops
+claiming issues for that repo entirely** (rather than claiming and releasing one every cycle); it
+retries locally each cycle and resumes on its own once the path has a usable workspace.
 
 ## Running several boards
 
