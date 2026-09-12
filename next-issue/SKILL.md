@@ -116,9 +116,10 @@ The worktree verified, take two records now, before any implementation work, reg
 ```bash
 realpath <new checkout path>                        # the absolute worktree path every subagent brief will carry
 git -C <primary checkout path> status --porcelain -uall   # the primary checkout's pre-existing dirt — the baseline
+git -C <primary checkout path> rev-parse HEAD              # the primary checkout's baseline HEAD
 ```
 
-Record `<new checkout path>` absolute because step 4 forbids relative paths in subagent briefs. The baseline is what "clean" means for this session: whatever it lists now was there before this session started and is not yours to touch — or to clean up. See "Leave the primary checkout as you found it" below.
+Record `<new checkout path>` absolute because step 4 forbids relative paths in subagent briefs. The baseline is what "clean" means for this session: whatever it lists now was there before this session started and is not yours to touch — or to clean up — and the baseline HEAD is what "clean" means for the primary checkout's own history, the value it must still point to for the same reason. See "Leave the primary checkout as you found it" below.
 
 Before touching any tab, decide which of the two cases below applies — that decision is
 conceptually the first thing to do, ahead of any tab action, though the two `worktree
@@ -203,15 +204,18 @@ When a subagent's first result comes back, confirm one file it claims to have wr
 
 ## Leave the primary checkout as you found it
 
-The finish line for this session is any of: a supervised stop-and-report after pushing, closing the issue (landing in step 6, or abandoning in step 7), and removing the worktree in step 7. Before each, re-run the baseline command from step 2 and compare:
+The finish line for this session is any of: a supervised stop-and-report after pushing, closing the issue (landing in step 6, or abandoning in step 7), and removing the worktree in step 7. Before each, re-run the baseline commands from step 2 and compare:
 
 ```bash
 git -C <primary checkout path> status --porcelain -uall
+git -C <primary checkout path> rev-parse HEAD
 ```
 
-The comparison matches by path only, ignoring any status-code change on an already-baselined path — an operator staging a pre-existing modification mid-session is still baseline, leave alone, not a new leak. Every path already in the baseline, by that path-only match, is pre-existing local state — someone's intentional edits, nothing to do with this issue. Leave it alone.
+The comparison matches by path only, ignoring any status-code change on an already-baselined path — an operator staging a pre-existing modification mid-session is still baseline, not a new leak. Every path already in the baseline, by that path-only match, is pre-existing local state — someone's intentional edits, nothing to do with this issue — leave it alone.
 
-A path new since the baseline is not automatically this session's fault: this session shares the primary checkout with an operator and other tools, and a third party can touch a file there for reasons unrelated to this issue while this session is alive. Restore only the new paths this session can actually attribute to itself — a path a subagent brief named, a path a subagent result claimed to have written, or a path one of this session's own commands touched. Restore each one by its exact path, and only those:
+The comparison also re-checks the baseline HEAD and watches for a baselined path that has disappeared from the porcelain listing entirely. Either signals that a stray git command ran in the primary checkout during this session (see step 4) — a stray commit can move HEAD and, if it swept up a baseline-dirty path, remove that path from the listing too, so the comparison must not reason only about paths still present. Neither is auto-repaired: an operator's own mid-session pull also legitimately moves HEAD, and this session cannot tell the difference. Name the changed HEAD or the vanished path in the report instead, the same as any other unattributable state.
+
+A path new since the baseline is not automatically this session's fault: this session shares the primary checkout with an operator and other tools, and a third party can touch a file there for reasons unrelated to this issue while this session is alive. Restore only the new paths this session can actually attribute to itself — a path a subagent brief named, a path a subagent result claimed to have written, or a path one of this session's own commands touched. This matching compares tree-relative paths: a brief that named `<new checkout path>/src/foo.ts` attributes a leak that appears as `src/foo.ts` in the primary checkout's porcelain output. Naming a path in a brief is only evidence a leak was possible there, not that one occurred — before restoring a path attributed solely by brief-naming (not also by a subagent result's claim or by this session's own command having touched it), confirm the dirty content actually corresponds to this session's work, for example that it reads as a draft or variant of the corresponding worktree file's content. If it doesn't, it's a third party's edit, not a leak: leave it and name it in the report, the same as the other unattributable cases below. Restore each one by its exact path, and only those:
 
 ```bash
 git -C <primary checkout path> checkout -- <path>    # tracked file modified or deleted
@@ -219,7 +223,7 @@ rm <primary checkout path>/<path>                     # untracked file that appe
 git -C <primary checkout path> restore --source=HEAD --staged --worktree -- <path>   # leak that got staged
 ```
 
-Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the primary checkout: the baseline can hold intentional local edits unrelated to any issue (it has), and a blanket restore destroys them. A path that is in the baseline but that this session may also have written to cannot be restored safely either — leave it and name it in the report instead. The same caution applies to a new-since-baseline path this session cannot attribute to itself by brief, result, or command: leave it and name it in the report too, rather than assuming every non-baseline path is this session's leak. Name every path restored (or left, per the previous two sentences) in the final report; a comparison showing nothing new needs no more than that it passed.
+Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the primary checkout: the baseline can hold intentional local edits unrelated to any issue (it has), and a blanket restore destroys them. A path that is in the baseline but that this session may also have written to, and a new-since-baseline path this session cannot attribute to itself (by brief, result, or command, or whose brief-named content doesn't correspond per above), both cannot be restored safely — leave each one and name it in the report instead, rather than assuming every non-baseline path is this session's leak. Name every path restored or deliberately left in the final report; a comparison showing nothing new needs no more than that it passed.
 
 ## 5. On "ready"
 
