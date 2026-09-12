@@ -40,20 +40,60 @@ so say so plainly and let the operator set Status themselves.
 as already claimed, skip this step (verify it still carries `mgr:in-flight` in repo mode,
 or `In progress` in project mode) and go straight to step 2.
 
-**Handed a tab by `work-the-board`?** With multi-board configs the watcher names the tab `<board>/issue-<N>: <title>` and the agent `<board>-issue-<N>` — use those exact names rather than deriving `issue-<N>` yourself.
+**Handed a tab by `work-the-board`?** With multi-board configs the watcher names the tab `<board>/issue-<N>: <title>` and the agent `<board>-issue-<N>` — use those exact names rather than deriving `issue-<N>` yourself. A watcher-launched session is always started inside the target repo's own herdr workspace by the watcher itself, so it always hits the common case in step 2 below, never the fallback.
 
 ## 2. Create the worktree and rename the tab
 
-```bash
-herdr worktree create --branch issue-<N>-<slug> --base main --label issue-<N> --no-focus
-```
-
-Read the worktree's absolute path and its tab id from the create result, then rename the
-tab to `issue-<N>: <TITLE>` — the watcher's tab sweep matches on that exact prefix:
+Isolate the issue with a plain git worktree — never `herdr worktree create`, which always
+spins up a brand-new, separate herdr workspace as an unavoidable side effect and is
+exactly the bug this skill must not reintroduce:
 
 ```bash
-herdr tab rename <TAB_ID> "issue-<N>: <TITLE>"
+git -C <primary checkout path> worktree add <new checkout path> -b issue-<N>-<slug> main
 ```
+
+Adopting an existing branch instead of cutting a fresh one? Base off that branch instead
+of `main`, same as before — only the mechanism changed, not the branch-selection logic:
+
+```bash
+git -C <primary checkout path> worktree add <new checkout path> <existing-branch>
+```
+
+**Common case — your pane is already inside the target repo's own workspace.** This is
+true for both a watcher-launched session and the ordinary human-started standalone
+session. Nothing herdr-specific is needed: just record `<new checkout path>`, root every
+subsequent read/edit/command there (see step 4), and rename the tab you are already
+running in — no new tab, no new workspace:
+
+```bash
+herdr tab rename "$HERDR_TAB_ID" "issue-<N>: <TITLE>"
+```
+
+(Watcher-launched sessions use the board's tab convention instead: `<board>/issue-<N>:
+<title>`.)
+
+**Rare fallback — your pane is NOT already inside the target repo's own workspace.**
+Check this before anything else (e.g. compare `$HERDR_WORKSPACE_ID` against the repo's
+own known/configured workspace id from `herdr workspace list`). If they differ, relocate
+your own running pane there first:
+
+```bash
+herdr pane move "$HERDR_PANE_ID" --workspace <repo_workspace_id> --new-tab --no-focus
+```
+
+Then immediately re-apply the tab label from the move's own response — do this in the
+same breath, before anything else:
+
+```bash
+herdr tab rename <new-tab-id-from-move-result> "issue-<N>: <TITLE>"
+```
+
+**Trap:** `pane move --new-tab` silently replaces whatever label the destination tab had
+with a bare number. Skip the immediate rename and the tab becomes invisible to every
+label-matching sweep. `$HERDR_PANE_ID` is always present as an env var inside a
+herdr-managed pane, but after the move `$HERDR_WORKSPACE_ID`/`$HERDR_TAB_ID` still name
+the OLD (pre-move) tab/workspace, not the new one — capture the new tab and workspace ids
+from the `pane move` response itself and use those going forward.
 
 ## 3. Open a draft PR
 
@@ -103,11 +143,13 @@ the issue without landing — in that case remove `mgr:in-flight` and leave the 
 with a comment explaining why, before proceeding):
 
 ```bash
-herdr worktree remove --workspace <WORKSPACE_ID>
+git -C <primary checkout path> worktree remove <checkout path>
 herdr tab close <TAB_ID>
 ```
 
 Remove the worktree, then close the tab, in that order — a lingering tab looks like a
-live session. Use the tab id from step 2; if unrecorded, `herdr tab list` and match the
-label prefix `issue-<N>:`. Never close the tab or remove the worktree before landing
-unless told to abandon the issue.
+live session. There is no separate worktree workspace to close: only the one tab this
+session has been running in the whole time (its id from the common case, or the
+move-result id from the fallback in step 2) needs closing. If unrecorded, `herdr tab
+list` and match the label prefix `issue-<N>:`. Never close the tab or remove the
+worktree before landing unless told to abandon the issue.
