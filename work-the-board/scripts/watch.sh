@@ -2132,27 +2132,42 @@ service_board_cycle() {
 
   log "in-flight=$count free=$free ready=$ready_n launching=$launch"
 
-  if [ "$launch" -gt 0 ]; then
-    launched=0
-    # One `herdr agent list` call per board per cycle, reused for every
-    # ready row below (see the agent_busy* check just after the
-    # cross-board dedupe): rules out relaunching an issue whose own
-    # launch-target agent name is still live from a prior session that
-    # has not exited yet (#20). agent_list_ok carries the fetch outcome
-    # explicitly rather than being inferred from live_agent_names being
-    # empty (review #20 MJ1): "fetch succeeded, zero live agents" and
-    # "fetch failed" are both empty-string cases and must not be
-    # conflated, or a failed fetch reads as proof no agent is live and
-    # wrongly clears every currently-latched agent_busy mark below,
-    # re-arming the report and the claim/release churn on every flap. A
-    # failed fetch is NOT fatal to this cycle's launches — it just means
-    # this cycle runs without the extra guard, exactly like every cycle
-    # before #20, so one bad fetch costs at most one ordinary
-    # agent-start-failure-and-release, never a new stuck loop.
+  # Fetch + reconcile herdr agent list whenever there is ready work to
+  # gate OR this board holds any AGENTBUSY latch that might need
+  # clearing (review #20 round 4 BL1). Reconciling only inside the
+  # ready-row loop below left a latch's clear path reachable ONLY when
+  # the per-issue loop actually reached that exact row - but the
+  # cycle-top CYCLE_SEEN seed (see the main loop's "Cross-board dedupe
+  # union for THIS cycle") puts every latched "<nwo>#<num>" into
+  # CYCLE_SEEN before ANY board runs, so the owning board's own
+  # per-issue loop dedupe-skips that row at the very first check below,
+  # before ever reaching the agent-busy check that used to clear it -
+  # starving the issue forever, on every board, once the blocking
+  # session exits, until a watcher restart. A board at full concurrency
+  # (launch=0) never even entered the old fetch block, so its stale
+  # latch could never clear at all while still poisoning CYCLE_SEEN for
+  # siblings. Reconciling here, independent of free capacity and of the
+  # per-issue loop, keeps the clear path reachable in both cases; a
+  # one-cycle relaunch lag after clearing is expected and fine (this
+  # cycle's CYCLE_SEEN seed already predates the clear).
+  bv "$CUR_IDX" AGENTBUSY
+  agentbusy_snapshot=$bvv
+  agent_list_ok=0
+  live_agent_names=""
+  if [ "$launch" -gt 0 ] || [ -n "$agentbusy_snapshot" ]; then
+    # agent_list_ok carries the fetch outcome explicitly rather than
+    # being inferred from live_agent_names being empty (review #20
+    # MJ1): "fetch succeeded, zero live agents" and "fetch failed" are
+    # both empty-string cases and must not be conflated, or a failed
+    # fetch reads as proof no agent is live and wrongly clears every
+    # currently-latched agent_busy mark, re-arming the report and the
+    # claim/release churn on every herdr flap. A failed fetch is NOT
+    # fatal to this cycle's launches — it just means this cycle runs
+    # without the extra guard, exactly like every cycle before #20, so
+    # one bad fetch costs at most one ordinary agent-start-failure-and-
+    # release, never a new stuck loop.
     agent_list_out=$(herdr agent list 2>/dev/null)
     agent_list_rc=$?
-    agent_list_ok=0
-    live_agent_names=""
     if [ "$agent_list_rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$agent_list_out"; then
       agent_list_ok=1
       live_agent_names=$(jq -r '.result.agents[]? | (.name // "")' <<<"$agent_list_out")
@@ -2162,15 +2177,31 @@ service_board_cycle() {
         report "herdr agent list failed or returned invalid JSON — launching without the check that skips relaunching an issue whose own agent is still live (#20's guard). If this repeats, the old per-cycle claim/release loop for such an issue can recur; a transient herdr fault is the likely cause."
       fi
     fi
+    if [ "$agent_list_ok" -eq 1 ] && [ -n "$agentbusy_snapshot" ]; then
+      while IFS= read -r busy_key; do
+        [ -z "$busy_key" ] && continue
+        busy_num=${busy_key##*#}
+        [ -z "$busy_num" ] && continue
+        grep -qxF "$CUR_NAME-issue-$busy_num" <<<"$live_agent_names" || agent_busy_clear "$CUR_IDX" "$busy_key"
+      done <<<"$agentbusy_snapshot"
+    fi
+  fi
+
+  if [ "$launch" -gt 0 ]; then
+    launched=0
     while IFS=$'\t' read -r nwo num title; do
       [ "$launched" -ge "$launch" ] && break
       [ -z "$num" ] && continue
       # Cross-board dedupe: an issue legitimately sitting on two boards (a
-      # label board and a project board, say) must still run only once.
-      # First in-flight sighting or first claim this cycle wins; the loser
-      # skips quietly - a log line, not an operator report.
+      # label board and a project board, say) must still run only once,
+      # and a ready issue latched agent_busy on ANY board (its own
+      # AGENTBUSY seeded into CYCLE_SEEN at cycle-top, or another board's
+      # right here in this same cycle) must not be claimed either. First
+      # in-flight sighting, first claim, or first agent-busy latch this
+      # cycle wins; the loser skips quietly - a log line, not an operator
+      # report.
       if grep -qxF "$nwo#$num" <<<"$CYCLE_SEEN"; then
-        log "issue #$num ($nwo): already in flight on another board, skipping"
+        log "issue #$num ($nwo): already accounted for this cycle (in flight elsewhere, or a still-latched live-agent skip), skipping"
         continue
       fi
       # An issue whose own launch-target agent name — "$CUR_NAME-issue-$num",
@@ -2191,9 +2222,12 @@ service_board_cycle() {
       # the same issue and worktree. agent_busy latches the operator
       # report to once per occurrence rather than every cycle — gated on
       # agent_list_ok so a failed fetch (empty live_agent_names for the
-      # wrong reason) can never look like a match — and is cleared below
-      # once a successful fetch no longer finds the name live, so a
-      # later, genuinely new occurrence of the same issue still reports.
+      # wrong reason) can never look like a match. The latch is cleared
+      # by the reconcile pass above this loop, not here (review #20
+      # round 4 BL1): clearing in-loop was only reachable when the
+      # per-issue loop got to this exact row, which the cycle-top
+      # CYCLE_SEEN seed (see above) prevents from cycle 2 of an
+      # occurrence onward.
       agent_name="$CUR_NAME-issue-$num"
       if [ "$agent_list_ok" -eq 1 ] && grep -qxF "$agent_name" <<<"$live_agent_names"; then
         CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
@@ -2205,9 +2239,6 @@ service_board_cycle() {
           log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
         fi
         continue
-      fi
-      if [ "$agent_list_ok" -eq 1 ]; then
-        agent_busy "$CUR_IDX" "$nwo#$num" && agent_busy_clear "$CUR_IDX" "$nwo#$num"
       fi
       # A repo whose workspace is gone and cannot be re-established gets no
       # claim at all: claiming an issue we cannot launch just releases it
