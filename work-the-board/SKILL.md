@@ -71,6 +71,26 @@ In project mode, run the same audit over the board's `In progress` cards instead
 
 A hold parked under `mgr:in-flight` silently eats a build slot — keep the two straight. When a `research` issue closes, check what it unblocked before letting the board run: work that resolves by a human act (a signup, an account, an approval) can look ready to the filter while being nobody's diff — give it `mgr:hold` and a comment instead.
 
+## Where panes live
+
+Every issue session's pane, and every operation session's pane, is a **tab inside that
+repo's own configured herdr `workspace`** — the same workspace id named in the board's
+`workspace` field (or, for a project board, that repo's `repos[]` entry's `workspace`
+field). No issue or operation ever gets a separate, per-worktree herdr workspace of its
+own.
+
+Git worktree isolation — a separate checkout and branch per issue, so concurrent issues
+never collide in the primary checkout — is a plain on-disk `git worktree` checkout only,
+with no herdr-level counterpart. This automation deliberately never calls herdr's own
+`worktree create`: that command always creates a second, separate herdr workspace as a
+side effect of making the checkout, which is exactly the bug that produced empty,
+agent-less orphan workspaces in the past.
+
+The watcher validates at startup that a configured `workspace` really is that repo's own
+primary workspace — its checkout matches `path`, and it is not itself a linked-worktree
+workspace — so a misconfigured value now fails loudly at startup instead of silently
+landing panes somewhere unrelated.
+
 ## Running several boards
 
 Use one watcher process for several boards when: independent boards run over one repo, one project board spans repos, or several repos need boards in the same session. Pass `--config <file>` instead of the positional args and mode; the file is loaded and validated once at startup and never re-read — changing it means restarting the watcher.
@@ -92,11 +112,11 @@ Use one watcher process for several boards when: independent boards run over one
 
 `poll_seconds` (optional, default 30) and `report_agent` (optional) are watcher-wide. Each board needs a unique `name` matching `^[a-z0-9-]+$` (it labels that board's tabs and agents), a `kind` (`repo` or `project`), and `concurrency` — required, never defaulted, per board. `mode` defaults `supervised`. A `repo` board additionally needs `repo` (`owner/repo`), `path`, `workspace`. A `project` board needs `owner`, `number`, and a non-empty `repos` array of `{repo, path, workspace}` — one entry per repo the board spans.
 
-Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, a `workspace` that isn't a live herdr workspace, or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
+Startup validation exits 2 naming the offending board and field for: a missing/duplicate `name`, a missing `concurrency`, a `path` that doesn't exist or isn't a git checkout, an `origin` remote that doesn't match the configured `repo`, a `workspace` that isn't that repo's own primary herdr workspace (its checkout must equal `path`, and it must not itself be a linked-worktree workspace — not merely "a workspace that exists"), or a `project` board with no `repos`. Concurrency is strictly per board — there is no global ceiling; the sum across boards is your total load, and the startup log line reports that sum plus an estimated gh requests/hour.
 
 ## 4. Start the watcher
 
-Read the current workspace id once (`herdr pane current`). Start the bundled script as a persistent background process — do not hand-roll the poll loop inline. One board — this form is unchanged, not deprecated:
+`<WORKSPACE_ID>` is the target repo's own primary herdr workspace — the workspace whose checkout is `<project dir>` itself, matching `path`/`workspace` in "Running several boards" below — never this board-watcher session's own workspace, and never `herdr pane current`. If `<project dir>` isn't already open as its own herdr workspace, open it as one first (see "Where panes live" above), then use that workspace's id. Start the bundled script as a persistent background process — do not hand-roll the poll loop inline. One board — this form is unchanged, not deprecated:
 
 ```
 hub op="start" name="<project>-work-the-board" application="bash" \
@@ -104,7 +124,7 @@ hub op="start" name="<project>-work-the-board" application="bash" \
   cwd="<project dir>" restart="on-failure" persist=true
 ```
 
-`<skill-dir>` is this skill's absolute directory (given in the invocation prompt's "Skill directory" footer). Args are workspace, concurrency, poll seconds, the report target (pass `board`, see "Reporting"), and the mode (`supervised`/`auto`; unknown mode exits 2). Append the trailing `--project <owner>/<number>` pair only in project mode. A malformed `--project` value, a board missing the Status field or its `Todo`/`In progress` options, or a token without the `project` scope exits 2 at startup with the reason.
+`<skill-dir>` is this skill's absolute directory (given in the invocation prompt's "Skill directory" footer). Args are `<WORKSPACE_ID>` — the target repo's own primary workspace, per above, never this board-watcher session's own workspace — `<CONCURRENCY>`, poll seconds, the report target (pass `board`, see "Reporting"), and the mode (`supervised`/`auto`; unknown mode exits 2). Append the trailing `--project <owner>/<number>` pair only in project mode. A malformed `--project` value, a board missing the Status field or its `Todo`/`In progress` options, or a token without the `project` scope exits 2 at startup with the reason.
 
 Several boards: write the config file (see "Running several boards" above) and pass it instead — `--config` cannot combine with positional args or `--project`:
 
@@ -123,7 +143,7 @@ The script does, every cycle:
 1. Counts open issues labeled `mgr:in-flight` — capacity in use.
 2. Selects the **ready** issues: open, carrying none of `mgr:in-flight`, `mgr:hold`, `research`, and every `Blocked by: #N` reference either absent or itself closed. Ordered `priority:high` first, then lowest issue number.
 3. Looks for work that already exists for that issue — an open PR whose head branch carries the number or whose title/body *closes* it, else a remote branch carrying the number — so the session **adopts** it instead of opening a second branch and PR. A bare `#N` mention is not enough: PRs routinely name related issues.
-4. For each free slot, takes the next ready issue, **claims it** with `mgr:in-flight`, opens a tab, starts an `omp` agent, renames the tab `<board>/issue-<N>: <title>`, and hands it the issue number plus adoption instructions. The agent is named `<board>-issue-<N>` (herdr agent names are global, so the board name keeps two boards' issue #12 apart). A session that fails to come up has its tab closed and its claim **released**.
+4. For each free slot, takes the next ready issue, **claims it** with `mgr:in-flight`, opens a tab inside the repo's own configured `workspace` (a plain on-disk `git worktree` checkout backs the session — it has no herdr workspace of its own), starts an `omp` agent, renames the tab `<board>/issue-<N>: <title>`, and hands it the issue number plus adoption instructions. The agent is named `<board>-issue-<N>` (herdr agent names are global, so the board name keeps two boards' issue #12 apart). A session that fails to come up has its tab closed and its claim **released**.
 5. Sweeps finished tabs (below).
 6. Sleeps, then repeats.
 
@@ -145,7 +165,7 @@ A project board's items are dispatched into their own mapped repo's `path` and `
 grep -n '"attribution":"user"' <session>.jsonl   # what the operator actually typed, and when
 ```
 
-**Tab lifecycle.** On `done` the session removes its own worktree, then closes its own tab. The watcher's sweep is only a backstop for a session that dies, is killed, or exits before teardown: it closes a `<board>/issue-<N>:` tab once that issue is CLOSED and its worktree is gone, every cycle. More working tabs than `mgr:in-flight` issues is normal, not a leak — a session outlives its claim (it drops the label and closes the issue on landing, then may keep working, e.g. a post-land review, until it exits). Tabs opened before this change carry the old `issue-<N>:` label and no longer match the sweep — do one manual `herdr tab rename`/close pass on any still open. This sweep and self-teardown both cover issue tabs only — an `op:` tab is neither swept nor self-closing; see Op-tab teardown in step 6, which is this session's own job.
+**Tab lifecycle.** On `done` the session removes its own worktree, then closes its own tab. The watcher's sweep is only a backstop for a session that dies, is killed, or exits before teardown: it closes a `<board>/issue-<N>:` tab once that issue is CLOSED and its worktree is gone, every cycle. More working tabs than `mgr:in-flight` issues is normal, not a leak — a session outlives its claim (it drops the label and closes the issue on landing, then may keep working, e.g. a post-land review, until it exits). A second sweep, `sweep_orphan_worktrees`, reaps stray herdr workspaces left over from the old per-worktree-workspace mechanism (or created by hand or another tool): a workspace belonging to one of the board's own repos, whose issue number it derives from its checkout path's basename (falling back to a tab label inside it) matching an issue-number pattern — never from the workspace's own display label — with no live agent in any of its panes, whose issue is not currently in flight, is removed (`herdr worktree remove`, never forced — a dirty checkout is reported once and left alone instead — then `herdr workspace close`). Before any of that, a local-only, no-GitHub-calls guard checks the candidate's checkout for an upstream tracking branch and for commits not yet pushed to it; a candidate that has no upstream, or has unpushed commits, or on which the check itself fails, is left untouched, not reaped, and reported once (`found orphan workspace … but its checkout has no upstream or has commits not yet pushed`). That guard protects unpushed work, not a deliberately-parked-but-clean checkout: a worktree that is clean and fully pushed is still reaped even if its issue is open but not in flight (e.g. carrying `mgr:hold`) — don't be surprised when a held issue's worktree disappears; the work itself is safe because it is on the remote branch. It never touches a repo's own configured `workspace`, a worktree whose issue is still in flight, or another board's repos, and it makes no GitHub calls. This only reaps a bare `issue-<N>:`-labeled tab when that tab lives inside one of those old linked-worktree workspaces — the whole workspace, tab included, is what gets removed. A bare `issue-<N>:`-labeled tab sitting inside a repo's own PRIMARY workspace — whether a genuine leftover from before the naming change, or the normal, ongoing shape a standalone `next-issue` session still produces for a manually-moved pane — lives in that repo's own configured `workspace`, so `sweep_orphan_worktrees` structurally excludes it, and it doesn't match `sweep_finished_tabs`' `<board>/issue-<N>:` pattern either: it is covered by **neither** sweep, and still needs a manual `herdr tab rename`/close pass once its issue leaves flight. This sweep and self-teardown both cover issue tabs only — an `op:` tab is neither swept nor self-closing; see Op-tab teardown in step 6, which is this session's own job.
 
 ## 5. Verify one cycle
 
@@ -159,6 +179,8 @@ herdr pane get <PANE_ID>   # agent_status should be "working" or "idle", not "un
 ```
 
 A pane stuck at `agent_status: "unknown"` with no session file means the launch failed in a way the script didn't catch; stop the watcher and re-check the `herdr` CLI surface (`herdr tab create --help`, `herdr agent start --help`) before restarting it.
+
+Also confirm nesting: `herdr pane get <PANE_ID>` (or `herdr workspace get <id>`) should report the launched issue's pane `workspace_id` equal to the board's configured `workspace` — it landed as a tab in the repo's own workspace, not somewhere else.
 
 `ready=0` with everything genuinely blocked or claimed is the correct steady state: report that as-is rather than forcing work.
 
@@ -195,12 +217,15 @@ herdr tab rename <TAB_ID> "op: <short description>"
 herdr agent prompt <name> "<operator's request, verbatim>"
 ```
 
-`<WORKSPACE_ID>` stays this session's own workspace, so the op tab sits beside the board
-tab; `<BOARD_PATH>` is the target repo's checkout — `path` in the config for a `repo`
-board, the mapped repo's `repos[]` entry for a `project` board, or `<project dir>` for a
-single positional board — the same directory issue tabs already land in via
-`--cwd "$item_path"`, so the operation pane opens in the repo it operates on instead of
-wherever this board session happens to be running.
+`<WORKSPACE_ID>` is the same per-board/per-repo `workspace` config value `launch_issue`
+uses for that repo — never this board-watcher session's own workspace — so the op tab
+lands beside issue tabs in the repo's own workspace. It is available directly from the
+board config file (or, for the single positional-board form, is the workspace argument
+passed to `watch.sh` at startup). `<BOARD_PATH>` is the target repo's checkout — `path`
+in the config for a `repo` board, the mapped repo's `repos[]` entry for a `project`
+board, or `<project dir>` for a single positional board — the same directory issue tabs
+already land in via `--cwd "$item_path"`, so the operation pane opens in the repo it
+operates on instead of wherever this board session happens to be running.
 
 Name it so it can't collide with an issue agent (`<board>-issue-<N>`) — e.g.
 `<board>-op-<short-slug>`. Do not `--wait` on the prompt; that would block this session's
