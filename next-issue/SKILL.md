@@ -300,8 +300,8 @@ gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
 gh pr ready <PR_N>
 ```
 
-Otherwise, write the body to a scratch file from scratch so quoting doesn't mangle
-backticks, `$`, or `!` in the prose, then apply it:
+Otherwise, write a fresh body to the scratch file so quoting doesn't mangle backticks,
+`$`, or `!` in the prose, then apply it:
 
 ```bash
 cat > /tmp/pr-<PR_N>-body.md <<'EOF'
