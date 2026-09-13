@@ -20,6 +20,17 @@ cycle it counts issues labelled `mgr:in-flight`, selects the ready ones, claims 
 slot's worth, and launches a session per issue that follows `next-issue`. Sessions plan
 and review through `plan-on-tier` / `review-on-tier`.
 
+The watcher also cleans up operation tabs it owns. An operation explicitly reports
+completion; the board delivers its result; an explicit keep-open request prevents cleanup.
+On the next tick, fresh ownership and agent-state checks precede ordinary Herdr tab close.
+Working, waiting, unknown, unrelated, anchor, and last-tab cases stay open.
+
+The registry persists across restarts at
+`${XDG_STATE_HOME:-$HOME/.local/state}/work-the-board/operations.sqlite3`; override it
+with `WORK_THE_BOARD_OPERATION_STATE_DB` consistently for the watcher and operations.
+Inspection and close are separate Herdr requests: the small intervening race is accepted,
+not an upstream API prerequisite.
+
 **Concurrency is yours to set and is never defaulted.** Say it when you start the board
 — "work the board, 3 at a time" — or the session asks before launching anything. It
 becomes the watcher's ceiling: each cycle it counts open issues labelled
@@ -73,7 +84,8 @@ for a in plan-tier1 plan-tier2 plan-tier3 review-tier1 review-tier2 review-tier3
 done
 ```
 
-Requires `gh` (authenticated), `jq`, `git`, and `herdr` on `PATH`. `plan-on-tier` and
+Requires Python 3 (standard library `sqlite3`), `gh` (authenticated), `jq`, `git`, and
+`herdr` on `PATH`. `plan-on-tier` and
 `review-on-tier` resolve each requested tier within the coordinator session's active
 provider. The coordinator must provide that provider and its provider-local tier selector
 in the handoff; a global `@tier1`/`@tier2`/`@tier3` role must not route a subagent to a
