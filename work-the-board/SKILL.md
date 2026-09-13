@@ -212,15 +212,22 @@ Also confirm nesting: `herdr pane get <PANE_ID>` (or `herdr workspace get <id>`)
 ## 6. Route other operator input
 
 `ready`, `land`, and `done` are never typed here — those go in the issue's own tab, and the
-board session never sees them. Anything else the operator sends this tab, at any point
-while the watcher runs, is either issue-worthy work, research, or a one-off operation.
-Classify it before acting; never run it in this pane:
+board session never sees them. Classify every other request before choosing a launch route;
+the request's ownership takes precedence over whether the work is read-only:
 
 | Input | Meaning | Action |
 |---|---|---|
+| Planning, implementation investigation, or review for a named issue | Issue support | Keep it in that issue's coordinator session; use its `plan-on-tier` or `review-on-tier` subagent. Never wrap it in an `op` session. |
 | Bug, feature, or anything else that resolves as a diff | Issue-worthy | Run `new-issue` inline, right now, in this session |
 | Resolves by a human deciding, approving, or registering something — not a diff | Research | Run `new-issue` the same way; it lands with the `research` label, so the watcher leaves it alone |
 | No diff to land at all — restart a local deployment, run a DB query, tail a log, poke a running service | Operation | Launch a fresh session for it (below); never run it here |
+| Basic answer, issue intake/dedupe, status report, or routing bookkeeping | No session | Answer or perform the bookkeeping directly; do not launch an issue or operation session |
+
+An issue-support request stays owned by the named issue even when it asks only for
+research, planning, investigation, or review. A dedicated process may be used when a
+provider-local tier requires it, but it retains the issue coordinator and planner/reviewer
+identity; do not add an `op` coordinator merely to host it. Use operation sessions only
+for genuine no-diff operational work, never as a generic wrapper for another route.
 
 Filing an issue or research item this way is bookkeeping, not work — it costs this
 session nothing and needs no session of its own.
