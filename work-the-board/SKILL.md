@@ -237,10 +237,15 @@ subagent:
 
 ```bash
 herdr tab create --workspace <WORKSPACE_ID> --cwd <BOARD_PATH> --no-focus
-herdr agent start <name> --kind omp --pane <PANE_ID>
+herdr agent start <name> --kind omp --pane <PANE_ID> -- --model @tier1
 herdr tab rename <TAB_ID> "op: <short description>"
 herdr agent prompt <name> "<operator's request, verbatim>"
 ```
+
+Routine visible operation sessions default to `@tier1`. An explicit operator request for
+`tier2` or `tier3` operation work is the exception. If a coordinator launches a requested
+`tier2`/`tier3` reviewer, the coordinator remains `@tier1`; only that specialized reviewer
+receives the requested tier.
 
 `<WORKSPACE_ID>` is the same per-board/per-repo `workspace` config value `launch_issue`
 uses for that repo — never this board-watcher session's own workspace — so the op tab
