@@ -2058,6 +2058,67 @@ $instructions"
   report "launched issue #$num ($title) on tab $tab. $CLAIMED_REPORT; that session owns it from here."
   return 0
 }
+# ---------------------------------------------------------------------------
+# Reconcile claimed issues against the single issue-session owner model.
+# `mgr:in-flight` is not ownership by itself: a watcher restart, a killed
+# session, or a failed handoff can leave the claim behind with no live agent.
+# The existing watcher is the recovery owner. It adopts the preserved branch/
+# PR through launch_issue, once per observed ownerless occurrence, without
+# adding a coordinator, helper tab, or second scheduler.
+#
+# This is deliberately local to the one herdr agent snapshot already fetched
+# for launch gating. A failed snapshot is fail-closed: the watcher must never
+# infer that an in-flight issue is ownerless from missing data.
+RECOVERY_LATCH=""
+
+recovery_latched() {
+  grep -qxF "$1" <<<"$RECOVERY_LATCH"
+}
+
+reconcile_inflight_sessions() { # <live agent records: name<TAB>status>
+  local live_records="$1" key nwo num title agent_name agent_status idle_key
+  while IFS= read -r key; do
+    [ -z "$key" ] && continue
+    nwo="${key%%#*}"
+    num="${key##*#}"
+    agent_name="$CUR_NAME-issue-$num"
+    agent_status=$(awk -F'\t' -v n="$agent_name" '$1 == n { print $2; exit }' <<<"$live_records")
+    case "$agent_status" in
+      working|idle|blocked)
+        RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
+        idle_key="idle:$key"
+        if [ "$CUR_MODE" = "auto" ] && [ "$agent_status" = "idle" ]; then
+          if ! recovery_latched "$idle_key"; then
+            RECOVERY_LATCH=$(printf '%s\n%s' "$RECOVERY_LATCH" "$idle_key")
+            log "issue #$num ($nwo): owner is idle; requesting its next bounded action"
+            report "issue #$num's owner $agent_name is idle; requested one bounded next action (holds remain the session's decision)."
+            herdr agent prompt "$agent_name" "Continue the current issue-session handoff with exactly one bounded next action. If blocked on the operator or an external answer, state the exact question and remain blocked; do not invent work." >/dev/null 2>&1 || true
+          fi
+        else
+          RECOVERY_LATCH=$(grep -vxF "$idle_key" <<<"$RECOVERY_LATCH")
+        fi
+        continue
+        ;;
+    esac
+    # A completed or unknown agent is not an owner. The claim is recoverable
+    # only after a successful snapshot proves no working, idle, or blocked
+    # session remains.
+    # A claim with no owner is recoverable work, not a reason to wait for a
+    # human. Keep the occurrence latched so a repeated 30-second scan cannot
+    # create duplicate sessions while Herdr is still settling.
+    recovery_latched "$key" && continue
+    RECOVERY_LATCH=$(printf '%s\n%s' "$RECOVERY_LATCH" "$key")
+    title=$(title_for "$nwo" "$num")
+    log "issue #$num ($nwo): in-flight claim has no live owner; adopting preserved work"
+    report "issue #$num has an in-flight claim but no live $agent_name owner; the watcher is adopting preserved work now."
+    if ! launch_issue "$nwo" "$num" "$title"; then
+      # A failed launch did not establish ownership; permit one retry on the
+      # next cycle while retaining the claim for the normal board audit.
+      RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
+    fi
+  done <<<"$inflight"
+}
+
 
 # ---------------------------------------------------------------------------
 # service_board <i>: the per-board error boundary. The whole cycle body for
@@ -2297,27 +2358,18 @@ service_board_cycle() {
   agentbusy_snapshot=$bvv
   agent_list_ok=0
   live_agent_names=""
-  if [ "$launch" -gt 0 ] || [ -n "$agentbusy_snapshot" ]; then
-    # agent_list_ok carries the fetch outcome explicitly rather than
-    # being inferred from live_agent_names being empty (review #20
-    # MJ1): "fetch succeeded, zero live agents" and "fetch failed" are
-    # both empty-string cases and must not be conflated, or a failed
-    # fetch reads as proof no agent is live and wrongly clears every
-    # currently-latched agent_busy mark, re-arming the report and the
-    # claim/release churn on every herdr flap. A failed fetch is NOT
-    # fatal to this cycle's launches — it just means this cycle runs
-    # without the extra guard, exactly like every cycle before #20, so
-    # one bad fetch costs at most one ordinary agent-start-failure-and-
-    # release, never a new stuck loop.
+  live_agent_records=""
+  if [ "$launch" -gt 0 ] || [ -n "$agentbusy_snapshot" ] || [ -n "$inflight" ]; then
     agent_list_out=$(herdr agent list 2>/dev/null)
     agent_list_rc=$?
     if [ "$agent_list_rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$agent_list_out"; then
       agent_list_ok=1
-      live_agent_names=$(jq -r '.result.agents[]? | (.name // "")' <<<"$agent_list_out")
+      live_agent_records=$(jq -r '.result.agents[]? | select((.agent_status // "") == "working" or (.agent_status // "") == "idle" or (.agent_status // "") == "blocked") | [(.name // ""), (.agent_status // "")] | @tsv' <<<"$agent_list_out")
+      live_agent_names=$(cut -f1 <<<"$live_agent_records")
     else
-      log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — launching this cycle without the already-live-agent check"
+      log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — launching this cycle without ownership reconciliation"
       if skip_once "agent-list-failed-launch-gate"; then
-        report "herdr agent list failed or returned invalid JSON — launching without the check that skips relaunching an issue whose own agent is still live (#20's guard). If this repeats, the old per-cycle claim/release loop for such an issue can recur; a transient herdr fault is the likely cause."
+        report "herdr agent list failed or returned invalid JSON — ownership reconciliation and live-agent launch gating are deferred until the next successful snapshot."
       fi
     fi
     if [ "$agent_list_ok" -eq 1 ] && [ -n "$agentbusy_snapshot" ]; then
@@ -2327,6 +2379,9 @@ service_board_cycle() {
         [ -z "$busy_num" ] && continue
         grep -qxF "$CUR_NAME-issue-$busy_num" <<<"$live_agent_names" || agent_busy_clear "$CUR_IDX" "$busy_key"
       done <<<"$agentbusy_snapshot"
+    fi
+    if [ "$agent_list_ok" -eq 1 ] && [ -n "$inflight" ]; then
+      reconcile_inflight_sessions "$live_agent_records"
     fi
   fi
 
