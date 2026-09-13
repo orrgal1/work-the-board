@@ -85,9 +85,25 @@ done
 ```
 
 Requires Python 3 (standard library `sqlite3`), `gh` (authenticated), `jq`, `git`, and
-`herdr` on `PATH`. `plan-on-tier` and
-`review-on-tier` resolve each requested tier within the coordinator session's active
-provider. The coordinator must provide that provider and its provider-local tier selector
-in the handoff; a global `@tier1`/`@tier2`/`@tier3` role must not route a subagent to a
-different provider. If the active provider has no mapping for the requested tier, the
-coordinator reports the missing mapping instead of launching a cross-provider subagent.
+`herdr` on `PATH`. `plan-on-tier` and `review-on-tier` resolve each requested tier
+within the coordinator session's active provider. Their tier agent files deliberately
+omit a `model` field: a global `@tier<N>` frontmatter value is executable routing and
+can cross providers before the handoff is read.
+
+The coordinator must resolve a provider-local selector from its live provider mapping,
+then load it through a session-scoped OMP overlay before spawning the child:
+
+```yaml
+task:
+  agentModelOverrides:
+    plan-tier2: <provider-local-plan-tier2-selector>
+    review-tier2: <provider-local-review-tier2-selector>
+    review-tier3: <provider-local-review-tier3-selector>
+```
+
+Checkpoint and quit only the coordinator process, leave its issue tab open, then resume
+the same session in the same pane with `--config <overlay>`. Keep the stable child name
+when resuming. Verify the child result metadata's `resolvedModel` and provider match
+the coordinator before accepting a plan or review. Never use a prose path as config,
+modify global roles, create helper tabs/processes, or retry a wrong-provider launch.
+If the active provider has no mapping, report that instead of inventing a selector.
