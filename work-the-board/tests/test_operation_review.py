@@ -201,6 +201,45 @@ controller.launch_operation("op", 0, **json.loads(sys.argv[5]))
                 controller.launch_operation("op", generation, **args)
         self.assertEqual(controller.herdr.log, before)
 
+    def _resume_legacy_start(self, failure_kind):
+        controller, args = self.launch_case(ProductionSessions)
+        controller.herdr.queue_failure("agent.start", kind=failure_kind)
+        with self.assertRaises(APIError):
+            controller.launch_operation("op", 0, **args)
+        create_id = "launch:op:0:create"
+        saved = controller.store.get_launch_intent(create_id)
+        legacy = {key: value for key, value in json.loads(saved.payload).items()
+                  if key in {"workspace", "cwd", "label"}}
+        with sqlite3.connect(controller.store.path) as db:
+            db.execute("UPDATE launch_intents SET payload = ? WHERE intent_id = ?",
+                       (json.dumps(legacy, sort_keys=True, separators=(",", ":")), create_id))
+            db.execute("PRAGMA user_version = 2")
+        restarted = OperationController(
+            OperationStore(controller.store.path), ProductionSessions(self.root / "herdr.json")
+        )
+        with self.assertRaises(LifecycleConflict):
+            restarted.launch_operation("op", 0, **dict(args, agent_name="unrelated-agent"))
+        self.assertEqual(restarted.launch_operation("op", 0, **args).state, OperationState.WORKING)
+        self.assertEqual(restarted.store.get_launch_intent(create_id).outcome, saved.outcome)
+        self.assertEqual(sum(row["operation"] == "tab.create" for row in restarted.herdr.log), 1)
+        self.assertEqual(sum(row["operation"] == "agent.start" and row["committed"]
+                             for row in restarted.herdr.log), 1)
+        self.assertEqual(sum(row["operation"] == "agent.prompt" for row in restarted.herdr.log), 1)
+        # A fully launched legacy request also has durable owner and prompt metadata.
+        with sqlite3.connect(controller.store.path) as db:
+            db.execute("UPDATE launch_intents SET payload = ? WHERE intent_id = ?",
+                       (json.dumps(legacy), create_id))
+        for changed in (dict(args, board="wrong-board"), dict(args, prompt="different action")):
+            with self.assertRaises(LifecycleConflict):
+                restarted.launch_operation("op", 0, **changed)
+        self.assertEqual(restarted.launch_operation("op", 0, **args).state, OperationState.WORKING)
+
+    def test_upgrade_resumes_old_create_and_retryable_start(self):
+        self._resume_legacy_start("api")
+
+    def test_upgrade_resumes_old_create_and_ambiguous_start(self):
+        self._resume_legacy_start("timeout_after_success")
+
 
 if __name__ == "__main__":
     unittest.main()

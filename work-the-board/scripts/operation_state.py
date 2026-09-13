@@ -634,9 +634,40 @@ class OperationStore:
                     or intent.generation != generation
                     or intent.kind != kind
                     or intent.idempotency_key != idempotency_key
-                    or intent.payload != encoded
                 ):
                     raise LifecycleConflict("launch intent identity or payload conflict")
+                if intent.payload != encoded:
+                    legacy = json.loads(intent.payload)
+                    legacy_keys = {"workspace", "cwd", "label"}
+                    if (
+                        kind != "create"
+                        or not isinstance(legacy, dict)
+                        or set(legacy) != legacy_keys
+                        or set(payload) != legacy_keys | {"board", "repo", "agent", "prompt"}
+                        or any(payload[key] != value for key, value in legacy.items())
+                    ):
+                        raise LifecycleConflict("launch intent identity or payload conflict")
+                    # Older controllers did not persist the whole business request at
+                    # creation. Bind missing fields only after checking every known value.
+                    if current is not None and int(current["generation"]) == generation:
+                        if any(current[key] != payload[key] for key in ("board", "repo", "workspace")):
+                            raise LifecycleConflict("legacy launch disagrees with registered ownership")
+                    for row in connection.execute(
+                        """SELECT payload FROM launch_intents
+                           WHERE operation_id = ? AND generation = ? AND kind IN ('start', 'prompt')""",
+                        (operation_id, generation),
+                    ):
+                        known = json.loads(row["payload"])
+                        if not isinstance(known, dict) or any(
+                            key in known and known[key] != payload[key]
+                            for key in ("agent", "prompt")
+                        ):
+                            raise LifecycleConflict("legacy launch disagrees with saved agent or prompt")
+                    connection.execute(
+                        "UPDATE launch_intents SET payload = ?, updated_at = ? WHERE intent_id = ?",
+                        (encoded, now, intent_id),
+                    )
+                    return self._launch_intent_row(connection, intent_id)
                 return intent
             if kind == "create" and current is not None and generation == int(current["generation"]):
                 raise LifecycleConflict("registered generation has no matching launch reservation")
