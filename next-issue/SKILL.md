@@ -223,7 +223,8 @@ from the `pane move` response itself and use those going forward.
 ## 3. Open a draft PR
 
 Push the branch and open a draft PR immediately, before any implementation work, so the
-issue has a visible in-progress artifact:
+issue has a visible in-progress artifact. `Closes #<N>` is a placeholder for now — step
+5 below states what the body must actually contain before the PR can be marked ready:
 
 ```bash
 git push -u origin issue-<N>-<slug>
@@ -264,9 +265,18 @@ Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the p
 
 ## 5. On "ready"
 
-Only when explicitly instructed:
+Only when explicitly instructed. Before running `gh pr ready`, replace the placeholder
+body from step 3 with the real record — this is the one place the requirement is
+stated, and it applies whether or not a plan or review also ran. The PR body must
+contain: what changed and why, the root cause when the issue is a bug, how it was
+verified (the concrete observation made, not just a claim that verification happened),
+and anything named-but-not-filed during the work. No fixed headings are required —
+write it as prose, in whatever shape fits the change; the requirement is on content,
+not form. A reviewer, and later anyone reading the merged PR, must be able to
+understand the change from the PR page alone, without opening the squash commit.
 
 ```bash
+gh pr edit <PR_N> --body "<body meeting the requirement above>"
 gh pr ready <PR_N>
 ```
 
