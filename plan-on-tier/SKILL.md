@@ -46,7 +46,7 @@ role text, task text, and a successful process start are not evidence.
 
 Spawn `plan-tier<N>` with a stable name so follow-up messages address the same child.
 The handoff states the provider and resolved selector for auditability, but the
-overlay above is the routing mechanism. 
+overlay above is the routing mechanism.
 
 ## 3. Relay, then iterate
 
