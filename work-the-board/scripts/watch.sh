@@ -812,8 +812,8 @@ mutation_error_class() { # <stderr file>
   local e
   e=$(cat "$1" 2>/dev/null)
   case "$e" in
+    *"rate limit"*|*"secondary rate"*|*"abuse detection"*|*"HTTP 429"*) printf 'rate limited' ;;
     *"missing required scopes"*|*"Bad credentials"*|*uthentication*|*"HTTP 401"*|*"HTTP 403"*|*"permission denied"*) printf 'authentication/authorization failure' ;;
-    *"rate limit"*|*"HTTP 429"*) printf 'rate limited' ;;
     *"Could not resolve"*|*"no such host"*|*"connection refused"*|*"dial tcp"*|*imeout*|*"TLS"*) printf 'network failure' ;;
     *"HTTP 5"*|*"service unavailable"*|*"internal server error"*) printf 'remote API failure' ;;
     *"HTTP 404"*|*"not found"*) printf 'not found' ;;
@@ -2337,16 +2337,26 @@ service_board_cycle() {
         [ "$CUR_KIND" = "repo" ] && claim_state=$(repo_board_claim_state "$nwo" "$num")
         case "$claim_state" in
           present)
-            log "issue #$num: claim command failed but $CLAIM_NOUN is present; launch skipped to avoid duplicate dispatch: $claim_diag"
-            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found the claim present, so launch was skipped to avoid duplicate dispatch; the next cycle will observe the existing state."
+            # A present failed claim may have consumed this board's slot even
+            # though no session was launched. Reserve the slot and the issue
+            # across the rest of this cycle; do not blindly remove a claim
+            # whose owner cannot be identified.
+            CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
+            launched=$((launched + 1))
+            log "issue #$num: claim command failed but $CLAIM_NOUN is present; no session launched, slot reserved to avoid duplicate dispatch: $claim_diag"
+            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found the claim present, so no session was launched by this attempt and the issue was reserved for the rest of this cycle. Ownership remains unresolved; the retained claim may consume capacity until an owner finishes or the documented board ownership audit reconciles it."
             ;;
           absent)
             log "issue #$num: claim failed and read-back found $CLAIM_NOUN absent: $claim_diag"
             report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found no claim; skipped this cycle and normal watcher recovery will retry."
             ;;
           *)
-            log "issue #$num: claim failed and read-back could not confirm $CLAIM_NOUN: $claim_diag"
-            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Claim state could not be confirmed; launch skipped to avoid duplicate dispatch."
+            # Unknown mutation state is also fail-closed: the command may
+            # have reached GitHub, so reserve both admission controls.
+            CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
+            launched=$((launched + 1))
+            log "issue #$num: claim failed and read-back could not confirm $CLAIM_NOUN; no session launched, slot reserved to avoid duplicate dispatch: $claim_diag"
+            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back could not confirm state; no session was launched by this attempt and the issue was reserved for the rest of this cycle. Ownership remains unresolved and the claim may consume capacity if the mutation succeeded; use the documented board ownership audit rather than replaying the mutation blindly."
             ;;
         esac
         continue
