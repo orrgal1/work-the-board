@@ -223,13 +223,15 @@ from the `pane move` response itself and use those going forward.
 ## 3. Open a draft PR
 
 Push the branch and open a draft PR immediately, before any implementation work, so the
-issue has a visible in-progress artifact. `Closes #<N>` is a placeholder for now — step
-5 below states what the body must actually contain before the PR can be marked ready:
+issue has a visible in-progress artifact:
 
 ```bash
 git push -u origin issue-<N>-<slug>
 gh pr create --draft --fill --head issue-<N>-<slug> --base main --body "Closes #<N>"
 ```
+
+`Closes #<N>` is a placeholder body for now — step 5 states what it must grow into,
+and the `Closes #<N>` link itself, before the PR can be marked ready.
 
 ## 4. Work strictly inside the worktree
 
@@ -265,18 +267,38 @@ Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the p
 
 ## 5. On "ready"
 
-Only when explicitly instructed. Before running `gh pr ready`, replace the placeholder
-body from step 3 with the real record — this is the one place the requirement is
-stated, and it applies whether or not a plan or review also ran. The PR body must
-contain: what changed and why, the root cause when the issue is a bug, how it was
-verified (the concrete observation made, not just a claim that verification happened),
-and anything named-but-not-filed during the work. No fixed headings are required —
-write it as prose, in whatever shape fits the change; the requirement is on content,
-not form. A reviewer, and later anyone reading the merged PR, must be able to
-understand the change from the PR page alone, without opening the squash commit.
+Only when explicitly instructed. Before running `gh pr ready`, bring the PR body up to
+the one standard this skill states for it: what changed and why, the root cause when the
+issue is a bug, how it was verified (the concrete observation made, not just a claim
+that verification happened), and anything noticed but deliberately not fixed or filed.
+No fixed headings are required — write it as prose, in whatever shape fits the change;
+the requirement is on content, not form. A reviewer, and later anyone reading the merged
+PR, must be able to understand the change from the PR page alone, without opening the
+squash commit — the PR body is the canonical record; a commit message may echo it but
+never replaces it.
+
+The body must still carry `Closes #<N>` (or another GitHub closing keyword). When a PR
+merges without this skill's own step 6 running — under `mgr:manual-approve`, an operator
+merges it later — that keyword is the only thing that closes the issue, and it cannot be
+recovered from the squash commit message afterward. This repo has already accumulated
+merged PRs missing it (see `work-the-board/SKILL.md`'s stale-issue audit); do not repeat
+that with the fuller body this step now demands.
+
+If a later review round changes the diff or what was verified, update the body again
+before landing — a body describing a pre-review state is stale by the time it merges.
+
+Adopting an existing PR that already carries a substantive body from a prior session?
+Extend it to meet the standard above rather than overwriting it; there is no step-3
+placeholder to replace on this path.
+
+Write the body to a file first so quoting doesn't mangle backticks, `$`, or `!` in the
+prose, then apply it:
 
 ```bash
-gh pr edit <PR_N> --body "<body meeting the requirement above>"
+cat > /tmp/pr-<N>-body.md <<'EOF'
+<body meeting the requirement above, including "Closes #<N>">
+EOF
+gh pr edit <PR_N> --body-file /tmp/pr-<N>-body.md
 gh pr ready <PR_N>
 ```
 
