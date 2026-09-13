@@ -62,6 +62,8 @@
 #   3. For each free slot, takes the next ready issue, CLAIMS it with
 #      mgr:in-flight, opens a tab, starts an omp agent, and hands it that
 #      specific issue number. Nothing ready means nothing launched.
+#      Existing in-flight claims are reconciled from the same validated
+#      Herdr snapshot; ambiguous ownership retains the claim and reports it.
 #   4. Sweeps tabs whose issue is closed and whose worktree is gone.
 # Then sleeps once, and repeats.
 #
@@ -1879,6 +1881,10 @@ board_repo_launchable() {   # <nwo>
   ws_dead_clear "$CUR_IDX" "$1"
   return 0
 }
+release_claim_if_owned() {
+  [ "${RECOVERY_MODE:-0}" -eq 1 ] || board_release "$1" "$2"
+}
+
 
 # Opens a tab, starts an omp agent, and hands it one specific, already-claimed
 # issue. Releases the claim and cleans up the tab if anything fails.
@@ -1894,7 +1900,7 @@ launch_issue() {
   # is a watcher bug, not a config gap: release and surface it.
   if ! item_path=$(repo_path "$CUR_IDX" "$nwo") || ! item_ws=$(repo_workspace "$CUR_IDX" "$nwo"); then
     log "issue #$num: BUG: repo $nwo is not in board $CUR_NAME's repo map, releasing claim"
-    board_release "$nwo" "$num"
+    release_claim_if_owned "$nwo" "$num"
     return 1
   fi
   orig_ws="$item_ws"
@@ -1946,34 +1952,35 @@ launch_issue() {
         # (#19 review round 3, MJ1): a shared key meant the first transient
         # blip on a repo silently swallowed every later genuine break
         # report for it, since skip_once never clears.
-        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; claim release attempted, retrying automatically"
+        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; launch outcome is recorded for context-aware claim handling"
         if skip_once "ws-transient:$nwo"; then
-          report "workspace gone, replacement not yet resolved: herdr confirmed $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path no longer exists, but a replacement could not be resolved for $nwo this cycle, likely a transient herdr/git hiccup ($WS_ENSURE_ERR). Issue #$num's claim release was attempted; the board retries the check locally on its own next cycle. If this repeats, update $(repo_ws_field "$CUR_IDX" "$nwo") to a workspace that is $item_path's own live primary workspace."
+          report "workspace gone, replacement not yet resolved: herdr confirmed $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path no longer exists, but a replacement could not be resolved for $nwo this cycle, likely a transient herdr/git hiccup ($WS_ENSURE_ERR). The claim is handled according to fresh-launch versus recovery ownership; the board retries the local check next cycle. If this repeats, update $(repo_ws_field "$CUR_IDX" "$nwo") to a workspace that is $item_path's own live primary workspace."
         fi
       else
         # Permanent, not transient: no workspace can be had for this repo.
-        log "issue #$num: board $CUR_NAME: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $orig_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim release attempted, no further claims for $nwo until this is fixed"
+        log "issue #$num: board $CUR_NAME: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $orig_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim handling follows launch context"
         if skip_once "ws-broken:$nwo"; then
-          report "config fault, NOT a transient launch failure: $(repo_ws_field "$CUR_IDX" "$nwo") is workspace $orig_ws, which no longer exists, and herdr could not open $item_path as a workspace either ($WS_ENSURE_ERR). Nothing will launch for $nwo on this board until this is fixed: check $item_path still exists and is that repo's own primary checkout, open it as its own herdr workspace, and set that field to the new workspace id. Issue #$num's claim release was attempted and may have failed; further issues for $nwo are now skipped WITHOUT claiming, so the board stops churning; it resumes on its own as soon as $item_path has a usable workspace, or after a restart."
+          report "config fault, NOT a transient launch failure: $(repo_ws_field "$CUR_IDX" "$nwo") is workspace $orig_ws, which no longer exists, and herdr could not open $item_path as a workspace either ($WS_ENSURE_ERR). Nothing will launch for $nwo on this board until this is fixed: check $item_path still exists and is that repo's own primary checkout, open it as its own herdr workspace, and set that field to the new workspace id. Claim handling follows fresh-launch versus recovery ownership; further issues for $nwo are now skipped WITHOUT claiming, so the board stops churning."
         fi
       fi
       ws_dead_mark "$CUR_IDX" "$nwo"
-      board_release "$nwo" "$num"
+      RECOVERY_RESULT=definite
+      release_claim_if_owned "$nwo" "$num"
       return 1
     fi
     # Anything else stays a transient launch failure, carrying herdr's own
     # error code so "retry will fix this" is distinguishable at a glance.
     log "issue #$num: tab create failed${err_code:+ ($err_code)}: $create_json"
-    report "issue #$num could not start: tab create failed${err_code:+ ($err_code)}. Claim release was attempted; issue returns to rotation if it succeeded."
-    board_release "$nwo" "$num"
+    report "issue #$num could not start: tab create failed${err_code:+ ($err_code)}; recovery retains the existing claim for a later retry."
+    release_claim_if_owned "$nwo" "$num"
     return 1
   done
   pane=$(jq -r '.result.root_pane.pane_id // empty' <<<"$create_json" 2>/dev/null)
   tab=$(jq -r '.result.tab.tab_id // empty' <<<"$create_json" 2>/dev/null)
   if [ -z "$pane" ] || [ -z "$tab" ]; then
     log "issue #$num: tab create returned no pane/tab id, response was: $create_json"
-    report "issue #$num could not start: tab create returned no pane id. Claim release was attempted; issue returns to rotation if it succeeded."
-    board_release "$nwo" "$num"
+    report "issue #$num could not start: tab create returned no pane id; recovery retains the existing claim pending inspection."
+    release_claim_if_owned "$nwo" "$num"
     return 1
   fi
 
@@ -2005,9 +2012,11 @@ launch_issue() {
       start_out_report="${start_out_report:0:300}…"
     fi
     [ -z "$start_out_report" ] && start_out_report="(herdr reported no error output)"
-    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closed; claim release was attempted and issue returns to rotation if it succeeded."
-    herdr tab close "$tab" >/dev/null 2>&1
-    board_release "$nwo" "$num"
+    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closure was attempted; recovery keeps the existing claim when cleanup is uncertain."
+    if herdr tab close "$tab" >/dev/null 2>&1; then
+      case "$start_out" in *agent_pane_busy*) RECOVERY_RESULT=definite ;; esac
+    fi
+    release_claim_if_owned "$nwo" "$num"
     return 1
   fi
 
@@ -2036,7 +2045,7 @@ launch_issue() {
 2. Implement, and verify proportionately: only what your change touches, no full-project test suite and no repo-wide formatters.
 3. Before landing, run a REVIEW per the review-on-tier skill against your finished diff. This is mandatory on every issue. Round 1 is that first full review pass; each further full re-review pass counts as the next round. Run rounds 1 and 2 at this issue's plan tier (TIER 2 if no plan was run), escalating to TIER 3 for round 3 and any further round. When rounds 1-2 ran below tier 3, round 3 is a new tier-3 subagent with no memory of the earlier rounds, so hand it the prior rounds' findings and what you changed in response before it reviews. Fix every real finding, re-review if you changed anything material, and state in your report what it raised and what you did about each item.
 4. If the issue carries mgr:manual-approve, mark the PR ready and stop there - do NOT merge it. Otherwise land it yourself: mark the PR ready, merge it squashed, $UNCLAIM_PHRASE.
-5. Then stop, completely. Remove your worktree, post your final report (noting explicitly if the PR is waiting on mgr:manual-approve rather than landed), and end your turn. Landing it, or leaving it ready for approval, is the finish line: do NOT review the landed commit, do NOT deploy or redeploy anything, do NOT update docs or changelogs, do NOT read AGENTS.md looking for follow-up chores, and do NOT pick up another issue. If you believe something genuinely remains, say so in your report and stop anyway - the board decides what happens next, not you."
+5. Then stop, completely. Remove your worktree only after landing (or explicit abandonment); when mgr:manual-approve stops at ready, retain the worktree and report that it is waiting for approval. Do not review the landed commit, deploy or redeploy anything, update docs or changelogs, read AGENTS.md for follow-up chores, or pick up another issue. If something genuinely remains, say so in your report and stop anyway - the board decides what happens next."
   else
     instructions="Implement and verify proportionately: only what your change touches, no full-project test suite and no repo-wide formatters. Then stop and report. Do not run gh pr ready, do not merge, do not close the issue, and do not remove the worktree - the operator instructs ready, land and done in this tab when ready."
   fi
@@ -2058,64 +2067,68 @@ $instructions"
   report "launched issue #$num ($title) on tab $tab. $CLAIMED_REPORT; that session owns it from here."
   return 0
 }
-# ---------------------------------------------------------------------------
-# Reconcile claimed issues against the single issue-session owner model.
-# `mgr:in-flight` is not ownership by itself: a watcher restart, a killed
-# session, or a failed handoff can leave the claim behind with no live agent.
-# The existing watcher is the recovery owner. It adopts the preserved branch/
-# PR through launch_issue, once per observed ownerless occurrence, without
-# adding a coordinator, helper tab, or second scheduler.
-#
-# This is deliberately local to the one herdr agent snapshot already fetched
-# for launch gating. A failed snapshot is fail-closed: the watcher must never
-# infer that an in-flight issue is ownerless from missing data.
+# Reconcile claims that outlive their issue session.  The watcher remains the
+# recovery owner: capacity and ready selection alone cannot recover a claim
+# that consumes the last slot.  Recovery is fail-closed on uncertain starts;
+# launch_issue only releases claims it acquired itself.
 RECOVERY_LATCH=""
-
-recovery_latched() {
-  grep -qxF "$1" <<<"$RECOVERY_LATCH"
-}
-
-reconcile_inflight_sessions() { # <live agent records: name<TAB>status>
-  local live_records="$1" key nwo num title agent_name agent_status idle_key
+recovery_latched() { grep -qxF "$1" <<<"$RECOVERY_LATCH"; }
+reconcile_inflight_sessions() {
+  local live_records="$1" key nwo num title agent_name agent_status agent_record owner_path
   while IFS= read -r key; do
     [ -z "$key" ] && continue
-    nwo="${key%%#*}"
-    num="${key##*#}"
+    nwo="${key%%#*}"; num="${key##*#}"
     agent_name="$CUR_NAME-issue-$num"
-    agent_status=$(awk -F'\t' -v n="$agent_name" '$1 == n { print $2; exit }' <<<"$live_records")
+    owner_path=$(repo_path "$CUR_IDX" "$nwo" 2>/dev/null || true)
+    agent_status=$(awk -F'\t' -v n="$agent_name" -v p="$owner_path" '$1 == n && $3 == p { print $2; exit }' <<<"$live_records")
+    agent_record=$(awk -F'\t' -v n="$agent_name" '$1 == n { print "present"; exit }' <<<"$live_records")
+    if [ "$agent_record" = "present" ] && [ -z "$agent_status" ]; then
+      if ! recovery_latched "ambiguous:$CUR_NAME:$key"; then
+        RECOVERY_LATCH=$(printf '%s\nambiguous:%s:%s' "$RECOVERY_LATCH" "$CUR_NAME" "$key")
+        report "issue #$num has a reserved agent name without matching repository identity; retaining its claim until ownership is resolved."
+      fi
+      continue
+    fi
+    if awk -F'\t' -v n="$num" -v own="$agent_name" '$1 != own && $1 ~ "-issue-" n "$" { found=1 } END { exit(found ? 0 : 1) }' <<<"$live_records"; then
+      if ! recovery_latched "ambiguous:$CUR_NAME:$key"; then
+        RECOVERY_LATCH=$(printf '%s\nambiguous:%s:%s' "$RECOVERY_LATCH" "$CUR_NAME" "$key")
+        report "issue #$num has an ambiguous reserved agent name; retaining its claim until the global name collision is resolved."
+      fi
+      continue
+    fi
+    RECOVERY_LATCH=$(grep -vxF "ambiguous:$CUR_NAME:$key" <<<"$RECOVERY_LATCH")
     case "$agent_status" in
-      working|idle|blocked)
+      working|blocked)
         RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
-        idle_key="idle:$key"
-        if [ "$CUR_MODE" = "auto" ] && [ "$agent_status" = "idle" ]; then
-          if ! recovery_latched "$idle_key"; then
-            RECOVERY_LATCH=$(printf '%s\n%s' "$RECOVERY_LATCH" "$idle_key")
-            log "issue #$num ($nwo): owner is idle; requesting its next bounded action"
-            report "issue #$num's owner $agent_name is idle; requested one bounded next action (holds remain the session's decision)."
-            herdr agent prompt "$agent_name" "Continue the current issue-session handoff with exactly one bounded next action. If blocked on the operator or an external answer, state the exact question and remain blocked; do not invent work." >/dev/null 2>&1 || true
-          fi
-        else
-          RECOVERY_LATCH=$(grep -vxF "$idle_key" <<<"$RECOVERY_LATCH")
+        RECOVERY_LATCH=$(grep -vxF "idle:$key" <<<"$RECOVERY_LATCH")
+        continue ;;
+      idle)
+        RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
+        if [ "$CUR_MODE" = "auto" ] && ! recovery_latched "idle:$key"; then
+          RECOVERY_LATCH=$(printf '%s\nidle:%s' "$RECOVERY_LATCH" "$key")
+          report "issue #$num's owner $agent_name is idle; requested continuation through reachable completion work."
+          herdr agent prompt "$agent_name" "Continue the current issue handoff through all reachable implementation, publication, verification, review, and authorized landing; preserve any explicit hold or external question." >/dev/null 2>&1 || RECOVERY_LATCH=$(grep -vxF "idle:$key" <<<"$RECOVERY_LATCH")
         fi
-        continue
-        ;;
+        continue ;;
+      done|failed|unknown)
+        continue ;;
+      "")
+        [ "$agent_record" = "present" ] && continue ;;
+      *)
+        [ "$agent_record" = "present" ] && continue ;;
     esac
-    # A completed or unknown agent is not an owner. The claim is recoverable
-    # only after a successful snapshot proves no working, idle, or blocked
-    # session remains.
-    # A claim with no owner is recoverable work, not a reason to wait for a
-    # human. Keep the occurrence latched so a repeated 30-second scan cannot
-    # create duplicate sessions while Herdr is still settling.
     recovery_latched "$key" && continue
     RECOVERY_LATCH=$(printf '%s\n%s' "$RECOVERY_LATCH" "$key")
     title=$(title_for "$nwo" "$num")
-    log "issue #$num ($nwo): in-flight claim has no live owner; adopting preserved work"
-    report "issue #$num has an in-flight claim but no live $agent_name owner; the watcher is adopting preserved work now."
-    if ! launch_issue "$nwo" "$num" "$title"; then
-      # A failed launch did not establish ownership; permit one retry on the
-      # next cycle while retaining the claim for the normal board audit.
+    report "issue #$num has an in-flight claim but no live owner; adopting preserved work."
+    RECOVERY_MODE=1
+    RECOVERY_RESULT=uncertain
+    if launch_issue "$nwo" "$num" "$title"; then
+      RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
+    elif [ "$RECOVERY_RESULT" = "definite" ]; then
       RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
     fi
+    RECOVERY_MODE=0
   done <<<"$inflight"
 }
 
@@ -2362,14 +2375,15 @@ service_board_cycle() {
   if [ "$launch" -gt 0 ] || [ -n "$agentbusy_snapshot" ] || [ -n "$inflight" ]; then
     agent_list_out=$(herdr agent list 2>/dev/null)
     agent_list_rc=$?
-    if [ "$agent_list_rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$agent_list_out"; then
+    if [ "$agent_list_rc" -eq 0 ] && jq -e '.result.agents | type == "array" and all(.[]; type == "object" and (.name | type == "string") and (.agent_status | type == "string") and (.cwd == null or (.cwd | type == "string")))' >/dev/null 2>&1 <<<"$agent_list_out"; then
       agent_list_ok=1
-      live_agent_records=$(jq -r '.result.agents[]? | select((.agent_status // "") == "working" or (.agent_status // "") == "idle" or (.agent_status // "") == "blocked") | [(.name // ""), (.agent_status // "")] | @tsv' <<<"$agent_list_out")
-      live_agent_names=$(cut -f1 <<<"$live_agent_records")
+      live_agent_names=$(jq -r '.result.agents[] | .name' <<<"$agent_list_out")
+      live_agent_records=$(jq -r '.result.agents[] | [.name, .agent_status, (.cwd // "")] | @tsv' <<<"$agent_list_out")
     else
-      log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — launching this cycle without ownership reconciliation"
+      log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — deferring ownership reconciliation and fresh dispatch"
+      launch=0
       if skip_once "agent-list-failed-launch-gate"; then
-        report "herdr agent list failed or returned invalid JSON — ownership reconciliation and live-agent launch gating are deferred until the next successful snapshot."
+        report "herdr agent list failed or returned invalid JSON — live-agent gating and issue recovery are deferred until a successful snapshot."
       fi
     fi
     if [ "$agent_list_ok" -eq 1 ] && [ -n "$agentbusy_snapshot" ]; then
