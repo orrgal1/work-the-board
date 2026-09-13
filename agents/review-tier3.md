@@ -1,7 +1,6 @@
 ---
 name: review-tier3
 description: Reviews a concrete target at tier 3 (strongest model role). Read-only; writes no code.
-model: "@tier3"
 spawns: ""
 tools: "read, grep, glob, bash"
 ---

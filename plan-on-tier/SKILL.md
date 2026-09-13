@@ -10,21 +10,43 @@ Launch one `plan-tier<N>` subagent, in-session, and keep it alive so the operato
 The coordinator's provider is authoritative. A tier changes capability within that
 provider; it must not select a globally configured model from another provider.
 
-## 1. Get the tier and provider
+## 1. Resolve and load the provider-local tier
 
-Use the tier (1, 2, or 3) the operator gave. If none was given, ask — never default.
-Read the active coordinator model/provider from the session context, then resolve the
-requested tier through that provider's configured tier mapping. Do not use the global
-`@tier<N>` role when it resolves to a different provider, and do not invent a model ID
-or substitute another provider. If the active provider has no tier mapping, report the
-missing mapping instead of launching a cross-provider subagent.
+Use the requested tier (1, 2, or 3) and the coordinator's actual provider/model
+metadata. Resolve that tier from the provider's configured mapping; never infer a
+model from the global `@tier<N>` role or from handoff prose. The mapping must be an
+actual model selector for the same provider, and a missing mapping is a hard error.
+
+Task agents are created before their prompt is delivered, so this cannot be fixed by
+putting the selector in the handoff. Before spawning, create a temporary config
+overlay containing only the executable override:
+
+```yaml
+task:
+  agentModelOverrides:
+    plan-tier<N>: <resolved-provider-local-selector>
+```
+
+Checkpoint the coordinator, quit only its OMP process (leave the issue tab open), then
+resume the same session in the same pane and with the overlay loaded:
+
+```bash
+checkpoint
+/quit
+herdr agent start <same-agent-name> <same-pane-id> -- \
+  --resume <same-session-path> --config <temporary-overlay>
+```
+
+Do not create a helper tab/process or retry a failed provider. The overlay is
+session-scoped and must not modify global configuration. Confirm the child metadata
+reports the expected `resolvedModel` and provider before accepting its plan; model
+role text, task text, and a successful process start are not evidence.
 
 ## 2. Launch the plan subagent
 
-Spawn `task` with `agent: plan-tier<N>` and a stable `name` (e.g. `PlanTier<N>`) so you can
-address it again. The handoff must state the coordinator provider and the provider-local
-model selector used for the requested tier; the tier agent must run on that selector.
-Pass the full plan request as its `task`.
+Spawn `plan-tier<N>` with a stable name so follow-up messages address the same child.
+The handoff states the provider and resolved selector for auditability, but the
+overlay above is the routing mechanism.
 
 ## 3. Relay, then iterate
 
