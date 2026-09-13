@@ -22,7 +22,7 @@ from operation_state import (
     ReportStatus,
 )
 from operation_state import OperationStore
-from ops import ControllerError, OperationController, SafetyDisposition
+from ops import AdapterError, ControllerError, HerdrAdapter, OperationController, SafetyDisposition
 
 
 class OperationFixture:
@@ -510,6 +510,24 @@ class OperationLifecycleTests(unittest.TestCase):
         self.assertEqual(
             case.store.get(case.operation_id, 1).state,
             OperationState.CLOSED,
+        )
+
+    def test_production_adapter_refuses_unguarded_close_without_invoking_herdr(self) -> None:
+        case = self.fixture("adapter-close")
+        adapter = HerdrAdapter(
+            (
+                sys.executable,
+                str(FIXTURES / "fake_herdr.py"),
+                "--state",
+                str(case.herdr_path),
+            )
+        )
+        with self.assertRaises(AdapterError):
+            adapter.close_tab(case.tab_id)
+        refreshed = FakeHerdr(case.herdr_path, now=case.clock)
+        self.assertEqual(
+            [entry for entry in refreshed.log if entry["operation"] == "tab.close"],
+            [],
         )
 
 if __name__ == "__main__":

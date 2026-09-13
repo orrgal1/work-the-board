@@ -142,14 +142,8 @@ class JsonCommand:
 class HerdrAdapter:
     """Adapter for the installed herdr CLI or its deterministic fixture."""
 
-    def __init__(
-        self,
-        command: Sequence[str] = ("herdr",),
-        *,
-        conditional_close: bool = False,
-    ) -> None:
+    def __init__(self, command: Sequence[str] = ("herdr",)) -> None:
         self._command = JsonCommand(command)
-        self.conditional_close = conditional_close
 
     @staticmethod
     def _items(payload: Mapping[str, Any], name: str) -> list[Mapping[str, Any]]:
@@ -202,23 +196,11 @@ class HerdrAdapter:
 
     def prompt_agent(self, name: str, prompt: str) -> Mapping[str, Any]:
         return self._command.call("agent", "prompt", name, prompt)
-
-
     def close_tab(self, tab_id: str, **expected: Any) -> Mapping[str, Any]:
-        arguments = ["tab", "close", tab_id]
-        if self.conditional_close:
-            names = {
-                "expected_workspace_id": "--expected-workspace",
-                "expected_pane_id": "--expected-pane",
-                "expected_session_id": "--expected-session",
-                "expected_agent_name": "--expected-agent",
-            }
-            for key, option in names.items():
-                value = expected.get(key)
-                if value:
-                    arguments.extend((option, str(value)))
-            arguments.append("--require-guard")
-        return self._command.call(*arguments)
+        raise AdapterError(
+            "installed Herdr exposes no atomic guarded tab-close capability",
+            committed=False,
+        )
 
 
 class ReportAdapter:
@@ -1214,7 +1196,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-db", required=True)
     parser.add_argument("--herdr-bin", default="herdr")
     parser.add_argument("--herdr-arg", action="append", default=[])
-    parser.add_argument("--herdr-conditional-close", action="store_true")
     parser.add_argument("--report-bin")
     parser.add_argument("--report-arg", action="append", default=[])
     parser.add_argument("--report-recipient")
@@ -1309,9 +1290,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         state_db = _absolute(args.state_db, "--state-db")
         herdr_command = [args.herdr_bin, *args.herdr_arg]
-        herdr = HerdrAdapter(
-            herdr_command, conditional_close=args.herdr_conditional_close
-        )
+        herdr = HerdrAdapter(herdr_command)
         reports = None
         if args.report_recipient:
             if args.report_bin:
