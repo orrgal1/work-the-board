@@ -42,7 +42,7 @@ class SnapshotError(ControllerError):
 
 
 class AdapterError(ControllerError):
-    def __init__(self, message: str, *, committed: bool = False) -> None:
+    def __init__(self, message: str, *, committed: Optional[bool] = None) -> None:
         super().__init__(message)
         self.committed = committed
 
@@ -106,7 +106,7 @@ class JsonCommand:
         output = completed.stdout.strip()
         error_output = completed.stderr.strip()
         if completed.returncode:
-            committed = False
+            committed: Optional[bool] = None
             message = error_output or output or f"command exited {completed.returncode}"
             for candidate in (error_output, output):
                 try:
@@ -116,7 +116,8 @@ class JsonCommand:
                 if isinstance(decoded, Mapping):
                     error = decoded.get("error")
                     if isinstance(error, Mapping):
-                        committed = error.get("committed") is True
+                        marker = error.get("committed")
+                        committed = marker if isinstance(marker, bool) else None
                         message = str(error.get("message") or error.get("code") or message)
                         break
             raise AdapterError(message, committed=committed)
@@ -128,7 +129,8 @@ class JsonCommand:
             raise SnapshotError("command JSON root is not an object")
         if decoded.get("ok") is False:
             error = decoded.get("error")
-            committed = isinstance(error, Mapping) and error.get("committed") is True
+            marker = error.get("committed") if isinstance(error, Mapping) else None
+            committed = marker if isinstance(marker, bool) else None
             message = error.get("message") if isinstance(error, Mapping) else "adapter rejected request"
             raise AdapterError(str(message), committed=committed)
         result = decoded.get("result", decoded)
@@ -331,11 +333,12 @@ class OperationController:
         try:
             outcome = effect()
         except BaseException as error:
+            committed = getattr(error, "committed", None)
             self.store.record_launch_intent(
                 intent_id,
-                LaunchIntentStatus.AMBIGUOUS
-                if getattr(error, "committed", False)
-                else LaunchIntentStatus.FAILED,
+                LaunchIntentStatus.PENDING
+                if committed is False
+                else LaunchIntentStatus.AMBIGUOUS,
                 evidence=str(error),
             )
             raise
