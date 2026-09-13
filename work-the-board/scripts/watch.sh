@@ -707,7 +707,12 @@ log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 # Fetch failures land their raw stderr here so the caller can log it. One
 # file, created once, read only on the failure path.
 ERRFILE=$(mktemp "${TMPDIR:-/tmp}/work-the-board-err.XXXXXX") || exit 1
-trap 'rm -f "$ERRFILE"' EXIT
+# Mutation stderr is never emitted raw: GitHub CLI errors can contain URLs,
+# headers, or other credentials. Only a bounded classification is reported.
+MUTATION_ERRFILE=$(mktemp "${TMPDIR:-/tmp}/work-the-board-mutation-err.XXXXXX") || exit 1
+trap 'rm -f "$ERRFILE" "$MUTATION_ERRFILE"' EXIT
+BOARD_MUTATION_RC=0
+BOARD_MUTATION_CLASS=""
 
 # Reports a material change to the board session so the operator sees it without
 # reading the log. Only state changes are reported — launches, failures, released
@@ -803,8 +808,39 @@ repo_board_ready() {
   jq -r --arg repo "$CUR_REPO" "$READY_FILTER" <<<"$data" 2>/dev/null
 }
 
-repo_board_claim() { gh issue edit "$2" -R "$1" --add-label mgr:in-flight >/dev/null 2>&1; }      # <nwo> <num>
-repo_board_release() { gh issue edit "$2" -R "$1" --remove-label mgr:in-flight >/dev/null 2>&1; } # <nwo> <num>
+mutation_error_class() { # <stderr file>
+  local e
+  e=$(cat "$1" 2>/dev/null)
+  case "$e" in
+    *"missing required scopes"*|*"Bad credentials"*|*uthentication*|*"HTTP 401"*|*"HTTP 403"*|*"permission denied"*) printf 'authentication/authorization failure' ;;
+    *"rate limit"*|*"HTTP 429"*) printf 'rate limited' ;;
+    *"Could not resolve"*|*"no such host"*|*"connection refused"*|*"dial tcp"*|*imeout*|*"TLS"*) printf 'network failure' ;;
+    *"HTTP 5"*|*"service unavailable"*|*"internal server error"*) printf 'remote API failure' ;;
+    *"HTTP 404"*|*"not found"*) printf 'not found' ;;
+    *"HTTP 409"*|*"already exists"*|*"already labeled"*) printf 'claim conflict' ;;
+    "") printf 'no diagnostic output' ;;
+    *) printf 'unclassified gh failure' ;;
+  esac
+}
+run_board_mutation() {
+  : >"$MUTATION_ERRFILE"
+  "$@" >/dev/null 2>"$MUTATION_ERRFILE"
+  BOARD_MUTATION_RC=$?
+  BOARD_MUTATION_CLASS=$(mutation_error_class "$MUTATION_ERRFILE")
+  return "$BOARD_MUTATION_RC"
+}
+board_mutation_diag() {
+  printf 'command exited %s (%s)' "$BOARD_MUTATION_RC" "$BOARD_MUTATION_CLASS"
+}
+repo_board_claim() { run_board_mutation gh issue edit "$2" -R "$1" --add-label mgr:in-flight; }      # <nwo> <num>
+repo_board_release() { run_board_mutation gh issue edit "$2" -R "$1" --remove-label mgr:in-flight; } # <nwo> <num>
+repo_board_claim_state() { # <nwo> <num>
+  local state rc
+  state=$(gh issue view "$2" -R "$1" --json labels --jq '[.labels[].name] | index("mgr:in-flight") // empty' 2>/dev/null)
+  rc=$?
+  [ "$rc" -eq 0 ] || { printf 'unknown'; return 0; }
+  [ -n "$state" ] && printf 'present' || printf 'absent'
+}
 
 # A closed issue still carrying mgr:in-flight is pure residue: the label no
 # longer gates anything (capacity only counts open issues) but it is exactly
@@ -813,7 +849,7 @@ repo_board_release() { gh issue edit "$2" -R "$1" --remove-label mgr:in-flight >
 # closed, so strip it.
 repo_board_finish() { # <nwo> <num>
   if gh issue view "$2" -R "$1" --json labels --jq '[.labels[].name] | index("mgr:in-flight") // empty' 2>/dev/null | grep -q .; then
-    gh issue edit "$2" -R "$1" --remove-label mgr:in-flight >/dev/null 2>&1 \
+    board_release "$1" "$2" \
       && log "issue #$2: stripped stale mgr:in-flight from a closed issue"
   fi
 }
@@ -913,19 +949,29 @@ project_item_id_for() { jq -r --arg r "$1" --argjson n "$2" 'first(.[] | select(
 project_status_for() { jq -r --arg r "$1" --argjson n "$2" 'first(.[] | select(.nwo == $r and .number == $n)) | .status // empty' <<<"$project_items" 2>/dev/null; } # <nwo> <num>
 
 project_set_status() { # <item id> <option id>
-  gh project item-edit --id "$1" --project-id "$CUR_PROJECT_ID" --field-id "$CUR_STATUS_FIELD_ID" --single-select-option-id "$2" >/dev/null 2>&1
+  run_board_mutation gh project item-edit --id "$1" --project-id "$CUR_PROJECT_ID" --field-id "$CUR_STATUS_FIELD_ID" --single-select-option-id "$2"
 }
 
 project_board_claim() { # <nwo> <num>
   local item
   item=$(project_item_id_for "$1" "$2")
-  [ -n "$item" ] && project_set_status "$item" "$CUR_OPT_IN_PROGRESS"
+  if [ -z "$item" ]; then
+    BOARD_MUTATION_RC=1
+    BOARD_MUTATION_CLASS="project item not found"
+    return 1
+  fi
+  project_set_status "$item" "$CUR_OPT_IN_PROGRESS"
 }
 
 project_board_release() { # <nwo> <num>
   local item
   item=$(project_item_id_for "$1" "$2")
-  [ -n "$item" ] && project_set_status "$item" "$CUR_OPT_TODO"
+  if [ -z "$item" ]; then
+    BOARD_MUTATION_RC=1
+    BOARD_MUTATION_CLASS="project item not found"
+    return 1
+  fi
+  project_set_status "$item" "$CUR_OPT_TODO"
 }
 
 # Moves a CLOSED issue's card to Done, once. PROJECT_DONE_SYNCED (persisted
@@ -973,7 +1019,19 @@ board_inflight() {
 }
 board_ready() { if [ "$CUR_KIND" = "project" ]; then project_board_ready; else repo_board_ready; fi; }
 board_claim() { if [ "$CUR_KIND" = "project" ]; then project_board_claim "$1" "$2"; else repo_board_claim "$1" "$2"; fi; }
-board_release() { if [ "$CUR_KIND" = "project" ]; then project_board_release "$1" "$2"; else repo_board_release "$1" "$2"; fi; }
+board_release() {
+  if [ "$CUR_KIND" = "project" ]; then
+    project_board_release "$1" "$2"
+  else
+    repo_board_release "$1" "$2"
+  fi
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "issue #$2: $CLAIM_NOUN release failed: $(board_mutation_diag); board state may remain claimed"
+    report "issue #$2: could not release $CLAIM_NOUN: $(board_mutation_diag). State may remain claimed; inspect before retrying."
+  fi
+  return "$rc"
+}
 board_finish() { if [ "$CUR_KIND" = "project" ]; then project_board_finish "$1" "$2"; else repo_board_finish "$1" "$2"; fi; }
 
 # Converts an ISO-8601 UTC timestamp ("2026-09-10T12:00:00Z") to epoch
@@ -1803,15 +1861,15 @@ launch_issue() {
         # (#19 review round 3, MJ1): a shared key meant the first transient
         # blip on a repo silently swallowed every later genuine break
         # report for it, since skip_once never clears.
-        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; claim released, retrying automatically"
+        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; claim release attempted, retrying automatically"
         if skip_once "ws-transient:$nwo"; then
-          report "workspace gone, replacement not yet resolved: herdr confirmed $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path no longer exists, but a replacement could not be resolved for $nwo this cycle, likely a transient herdr/git hiccup ($WS_ENSURE_ERR). Issue #$num's claim was released; the board retries the check locally on its own next cycle. If this repeats, update $(repo_ws_field "$CUR_IDX" "$nwo") to a workspace that is $item_path's own live primary workspace."
+          report "workspace gone, replacement not yet resolved: herdr confirmed $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path no longer exists, but a replacement could not be resolved for $nwo this cycle, likely a transient herdr/git hiccup ($WS_ENSURE_ERR). Issue #$num's claim release was attempted; the board retries the check locally on its own next cycle. If this repeats, update $(repo_ws_field "$CUR_IDX" "$nwo") to a workspace that is $item_path's own live primary workspace."
         fi
       else
         # Permanent, not transient: no workspace can be had for this repo.
-        log "issue #$num: board $CUR_NAME: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $orig_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim released, no further claims for $nwo until this is fixed"
+        log "issue #$num: board $CUR_NAME: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $orig_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim release attempted, no further claims for $nwo until this is fixed"
         if skip_once "ws-broken:$nwo"; then
-          report "config fault, NOT a transient launch failure: $(repo_ws_field "$CUR_IDX" "$nwo") is workspace $orig_ws, which no longer exists, and herdr could not open $item_path as a workspace either ($WS_ENSURE_ERR). Nothing will launch for $nwo on this board until this is fixed: check $item_path still exists and is that repo's own primary checkout, open it as its own herdr workspace, and set that field to the new workspace id. Issue #$num's claim was released and further issues for $nwo are now skipped WITHOUT claiming, so the board stops churning; it resumes on its own as soon as $item_path has a usable workspace, or after a restart."
+          report "config fault, NOT a transient launch failure: $(repo_ws_field "$CUR_IDX" "$nwo") is workspace $orig_ws, which no longer exists, and herdr could not open $item_path as a workspace either ($WS_ENSURE_ERR). Nothing will launch for $nwo on this board until this is fixed: check $item_path still exists and is that repo's own primary checkout, open it as its own herdr workspace, and set that field to the new workspace id. Issue #$num's claim release was attempted and may have failed; further issues for $nwo are now skipped WITHOUT claiming, so the board stops churning; it resumes on its own as soon as $item_path has a usable workspace, or after a restart."
         fi
       fi
       ws_dead_mark "$CUR_IDX" "$nwo"
@@ -1821,7 +1879,7 @@ launch_issue() {
     # Anything else stays a transient launch failure, carrying herdr's own
     # error code so "retry will fix this" is distinguishable at a glance.
     log "issue #$num: tab create failed${err_code:+ ($err_code)}: $create_json"
-    report "issue #$num could not start: tab create failed${err_code:+ ($err_code)}. Claim released, issue back in rotation."
+    report "issue #$num could not start: tab create failed${err_code:+ ($err_code)}. Claim release was attempted; issue returns to rotation if it succeeded."
     board_release "$nwo" "$num"
     return 1
   done
@@ -1829,7 +1887,7 @@ launch_issue() {
   tab=$(jq -r '.result.tab.tab_id // empty' <<<"$create_json" 2>/dev/null)
   if [ -z "$pane" ] || [ -z "$tab" ]; then
     log "issue #$num: tab create returned no pane/tab id, response was: $create_json"
-    report "issue #$num could not start: tab create returned no pane id. Claim released, issue back in rotation."
+    report "issue #$num could not start: tab create returned no pane id. Claim release was attempted; issue returns to rotation if it succeeded."
     board_release "$nwo" "$num"
     return 1
   fi
@@ -1862,7 +1920,7 @@ launch_issue() {
       start_out_report="${start_out_report:0:300}…"
     fi
     [ -z "$start_out_report" ] && start_out_report="(herdr reported no error output)"
-    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closed and claim released, issue back in rotation."
+    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closed; claim release was attempted and issue returns to rotation if it succeeded."
     herdr tab close "$tab" >/dev/null 2>&1
     board_release "$nwo" "$num"
     return 1
@@ -2274,8 +2332,23 @@ service_board_cycle() {
         fi
       fi
       if ! board_claim "$nwo" "$num"; then
-        log "issue #$num: claim failed (raced?), skipping"
-        report "issue #$num: could not claim $CLAIM_NOUN (raced with another session?), skipped this cycle."
+        claim_diag=$(board_mutation_diag)
+        claim_state="unknown"
+        [ "$CUR_KIND" = "repo" ] && claim_state=$(repo_board_claim_state "$nwo" "$num")
+        case "$claim_state" in
+          present)
+            log "issue #$num: claim command failed but $CLAIM_NOUN is present; launch skipped to avoid duplicate dispatch: $claim_diag"
+            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found the claim present, so launch was skipped to avoid duplicate dispatch; the next cycle will observe the existing state."
+            ;;
+          absent)
+            log "issue #$num: claim failed and read-back found $CLAIM_NOUN absent: $claim_diag"
+            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found no claim; skipped this cycle and normal watcher recovery will retry."
+            ;;
+          *)
+            log "issue #$num: claim failed and read-back could not confirm $CLAIM_NOUN: $claim_diag"
+            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Claim state could not be confirmed; launch skipped to avoid duplicate dispatch."
+            ;;
+        esac
         continue
       fi
       CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
