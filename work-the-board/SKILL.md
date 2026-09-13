@@ -258,20 +258,19 @@ retained tab.
 when present, rather than the stale config value.
 
 ```bash
-create_json=$(herdr tab create --workspace "$WORKSPACE_ID" --cwd "$BOARD_PATH" --no-focus)
-PANE_ID=$(jq -r '.result.root_pane.pane_id // empty' <<<"$create_json")
-TAB_ID=$(jq -r '.result.tab.tab_id // empty' <<<"$create_json")
-herdr agent start "$AGENT_NAME" --kind omp --pane "$PANE_ID"
-herdr tab rename "$TAB_ID" "op: <short description>"
-pane_json=$(herdr pane get "$PANE_ID")
-TERMINAL_ID=$(jq -r '.result.pane.terminal_id // empty' <<<"$pane_json")
-SESSION_ID=$(jq -r '.result.pane.session_id // .result.pane.agent_session.value // empty' <<<"$pane_json")
-"${OPS[@]}" launch "$OPERATION_ID" 0 \
+"${OPS[@]}" launch-operation "$OPERATION_ID" 0 \
   --board "$BOARD" --repo "$REPO" --workspace "$WORKSPACE_ID" \
-  --tab "$TAB_ID" --pane "$PANE_ID" --terminal "$TERMINAL_ID" \
-  --session "$SESSION_ID" --evidence "runtime identity verified before prompt"
-herdr agent prompt "$AGENT_NAME" "<operator request verbatim, plus the lifecycle handoff below>"
+  --cwd "$BOARD_PATH" --agent "$AGENT_NAME" \
+  --label "op: <short description>" \
+  --prompt "<operator request verbatim, plus the lifecycle handoff below>" \
+  --evidence "durable launch intents reconciled before business prompt"
 ```
+
+`launch-operation` durably journals tab creation, agent start, and the business prompt
+before each side effect. Restart reconciliation adopts a unique matching created tab or
+agent without repeating the action; ambiguity fails closed, and retry occurs only after
+the runtime snapshot proves the side effect absent. The operation identity is registered
+before the business prompt is sent.
 
 The root pane is `.result.root_pane.pane_id`. Registration must succeed before the
 business prompt is sent; otherwise no operation owns that tab. Agent names remain outside

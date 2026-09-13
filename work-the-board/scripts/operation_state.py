@@ -53,10 +53,10 @@ class CloseDisposition(str, Enum):
 
 class LaunchIntentStatus(str, Enum):
     PENDING = "pending"
+    EXECUTING = "executing"
     COMMITTED = "committed"
     AMBIGUOUS = "ambiguous"
     FAILED = "failed"
-
 
 @dataclass(frozen=True)
 class LaunchIntent:
@@ -353,13 +353,11 @@ CREATE TABLE IF NOT EXISTS launch_intents (
     kind TEXT NOT NULL CHECK (kind IN ('create', 'start', 'prompt')),
     idempotency_key TEXT NOT NULL UNIQUE,
     payload TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'committed', 'ambiguous', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'committed', 'ambiguous', 'failed')),
     outcome TEXT,
     evidence TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    FOREIGN KEY (operation_id, generation)
-        REFERENCES operations (operation_id, generation) ON DELETE CASCADE
+    updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS launch_intents_operation
     ON launch_intents (operation_id, generation, status, created_at);
@@ -613,6 +611,19 @@ class OperationStore:
                     (operation_id, generation),
                 )
             ]
+
+    def claim_launch_intent(self, intent_id: str) -> Optional[LaunchIntent]:
+        with self._transaction() as connection:
+            intent = self._launch_intent_row(connection, intent_id)
+            if intent.status != LaunchIntentStatus.PENDING:
+                return None
+            connection.execute(
+                """UPDATE launch_intents
+                   SET status = 'executing', updated_at = ?
+                   WHERE intent_id = ? AND status = 'pending'""",
+                (self._clock(), intent_id),
+            )
+            return self._launch_intent_row(connection, intent_id)
 
     def record_launch_intent(
         self,

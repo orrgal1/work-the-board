@@ -21,8 +21,8 @@ slot's worth, and launches a session per issue that follows `next-issue`. Sessio
 and review through `plan-on-tier` / `review-on-tier`.
 
 One watcher tick also maintains registered one-off operations through
-`work-the-board/scripts/ops.py`. Operation state, reports, acknowledgments, bounded
-retention leases, and close intents live in a restart-safe SQLite registry at
+`work-the-board/scripts/ops.py`. Operation state, restart-safe create/start/prompt
+intents, reports, acknowledgments, bounded retention leases, and close intents live in a
 `${XDG_STATE_HOME:-$HOME/.local/state}/work-the-board/operations.sqlite3` by default;
 set `WORK_THE_BOARD_OPERATION_STATE_DB` to another absolute path when the watcher,
 board session, and operation agents all use that same path. Runtime `idle`/`done` is

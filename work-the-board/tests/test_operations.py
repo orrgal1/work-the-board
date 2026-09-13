@@ -12,7 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(FIXTURES))
 
 from fake_clock import FakeClock
-from fake_herdr import FakeHerdr
+from fake_herdr import FakeHerdr, TimeoutAfterSuccess
 from fake_reports import FakeReports
 from operation_state import (
     LaunchIntentStatus,
@@ -431,9 +431,9 @@ class OperationLifecycleTests(unittest.TestCase):
             "retry-key",
             {"label": "business-action"},
         )
-        case.store.record_launch_intent(
-            "retry-intent", LaunchIntentStatus.AMBIGUOUS, evidence="response lost"
-        )
+        claimed = case.store.claim_launch_intent("retry-intent")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.status, LaunchIntentStatus.EXECUTING)
         retried = restarted.execute_launch_intent(
             case.operation_id,
             1,
@@ -446,6 +446,71 @@ class OperationLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(retried, {"started": "true"})
         self.assertEqual(case.store.get_launch_intent("retry-intent").status, LaunchIntentStatus.COMMITTED)
+
+    def test_launch_operation_reconciles_create_and_start_but_never_replays_ambiguous_prompt(self) -> None:
+        for failed_step in ("tab.create", "agent.start", "agent.prompt"):
+            root = Path(self.temporary.name) / failed_step.replace(".", "-")
+            root.mkdir()
+            clock = FakeClock(200.0)
+            herdr_path = root / "herdr.json"
+            store_path = root / "operations.sqlite3"
+            herdr = FakeHerdr(herdr_path, now=clock)
+            workspace = herdr.create_workspace(
+                str(root), workspace_id=f"ws-{failed_step}", anchor=True
+            )
+            herdr.queue_failure(failed_step, kind="timeout_after_success")
+            controller = OperationController(
+                OperationStore(str(store_path), clock=clock), herdr, clock=clock
+            )
+            arguments = dict(
+                board="board-main",
+                repo="owner/repo",
+                workspace=workspace["workspace_id"],
+                cwd=str(root),
+                agent_name=f"agent-{failed_step}",
+                prompt="perform the business action exactly once",
+                label="op: crash recovery",
+                evidence="fixture launch",
+            )
+            with self.assertRaises(TimeoutAfterSuccess):
+                controller.launch_operation("operation", 0, **arguments)
+
+            restarted_herdr = FakeHerdr(herdr_path, now=clock)
+            restarted = OperationController(
+                OperationStore(str(store_path), clock=clock),
+                restarted_herdr,
+                clock=clock,
+            )
+            if failed_step == "agent.prompt":
+                with self.assertRaises(ControllerError):
+                    restarted.launch_operation("operation", 0, **arguments)
+            else:
+                operation = restarted.launch_operation("operation", 0, **arguments)
+                self.assertEqual(operation.state, OperationState.WORKING)
+            actions = [
+                entry for entry in restarted_herdr.log
+                if entry["operation"] == failed_step
+            ]
+            self.assertEqual(len(actions), 1, failed_step)
+
+    def test_persistent_service_survives_controlled_operation_close(self) -> None:
+        case = self.fixture("persistent-service")
+        service = case.herdr.start_service(
+            case.pane_id, name="deployment", persistent=True
+        )
+        case.complete_and_acknowledge()
+        case.controller.tick()
+
+        stored = next(
+            item for item in case.herdr.list_services()
+            if item["service_id"] == service["service_id"]
+        )
+        self.assertTrue(stored["running"])
+        self.assertTrue(stored["detached"])
+        self.assertEqual(
+            case.store.get(case.operation_id, 1).state,
+            OperationState.CLOSED,
+        )
 
 if __name__ == "__main__":
     unittest.main()

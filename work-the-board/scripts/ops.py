@@ -173,13 +173,34 @@ class HerdrAdapter:
         arguments = ["pane", "list"]
         if workspace_id is not None:
             arguments.extend(("--workspace", workspace_id))
+        panes = self._items(self._command.call(*arguments), "panes")
         if tab_id is not None:
-            # Supported by the fixture. Production herdr is filtered locally.
-            arguments.extend(("--tab", tab_id))
-        return self._items(self._command.call(*arguments), "panes")
+            panes = [pane for pane in panes if pane.get("tab_id") == tab_id]
+        return panes
 
     def list_agents(self) -> list[Mapping[str, Any]]:
         return self._items(self._command.call("agent", "list"), "agents")
+    def create_tab(
+        self, workspace_id: str, cwd: str, *, label: str
+    ) -> Mapping[str, Any]:
+        return self._command.call(
+            "tab", "create", "--workspace", workspace_id, "--cwd", cwd,
+            "--label", label, "--no-focus"
+        )
+
+    def get_pane(self, pane_id: str) -> Mapping[str, Any]:
+        return self._command.call("pane", "get", pane_id).get("pane", {})
+
+    def start_agent(
+        self, name: str, pane_id: str, *, kind: str = "omp"
+    ) -> Mapping[str, Any]:
+        return self._command.call(
+            "agent", "start", name, "--kind", kind, "--pane", pane_id
+        )
+
+    def prompt_agent(self, name: str, prompt: str) -> Mapping[str, Any]:
+        return self._command.call("agent", "prompt", name, prompt)
+
 
     def close_tab(self, tab_id: str, **expected: Any) -> Mapping[str, Any]:
         arguments = ["tab", "close", tab_id]
@@ -280,7 +301,10 @@ class OperationController:
         )
         if intent.status == LaunchIntentStatus.COMMITTED:
             return json.loads(intent.outcome or "{}")
-        if intent.status == LaunchIntentStatus.AMBIGUOUS:
+        if intent.status in {
+            LaunchIntentStatus.EXECUTING,
+            LaunchIntentStatus.AMBIGUOUS,
+        }:
             existing = probe()
             if existing is None:
                 raise ControllerError(
@@ -301,6 +325,9 @@ class OperationController:
             )
         if intent.status == LaunchIntentStatus.FAILED:
             raise ControllerError(intent.evidence or f"launch intent {intent_id!r} failed")
+        claimed = self.store.claim_launch_intent(intent_id)
+        if claimed is None:
+            raise ControllerError(f"launch intent {intent_id!r} is already executing")
         try:
             outcome = effect()
         except BaseException as error:
@@ -322,10 +349,130 @@ class OperationController:
         self.store.record_launch_intent(
             intent_id,
             LaunchIntentStatus.COMMITTED,
+
             outcome=outcome,
             evidence="launch side effect completed",
         )
         return outcome
+    def launch_operation(
+        self,
+        operation_id: str,
+        generation: int,
+        *,
+        board: str,
+        repo: str,
+        workspace: str,
+        cwd: str,
+        agent_name: str,
+        prompt: str,
+        label: str,
+        evidence: str,
+    ) -> OperationRecord:
+        nonce_label = f"{label} [{operation_id}:{generation}]"
+
+        def probe_create() -> Any:
+            tabs = [
+                tab for tab in self.herdr.list_tabs(workspace)
+                if tab.get("workspace_id") == workspace
+                and tab.get("label") == nonce_label
+            ]
+            if not tabs:
+                return False
+            if len(tabs) != 1:
+                return None
+            panes = self.herdr.list_panes(workspace, tabs[0].get("tab_id"))
+            if len(panes) != 1 or panes[0].get("cwd") != cwd:
+                return None
+            return {"tab": tabs[0], "root_pane": panes[0]}
+
+        created = self.execute_launch_intent(
+            operation_id,
+            generation,
+            intent_id=f"launch:{operation_id}:{generation}:create",
+            kind="create",
+            idempotency_key=f"{operation_id}:{generation}:create",
+            payload={"workspace": workspace, "cwd": cwd, "label": nonce_label},
+            effect=lambda: self.herdr.create_tab(workspace, cwd, label=nonce_label),
+            probe=probe_create,
+        )
+        tab = created.get("tab")
+        pane = created.get("root_pane")
+        if not isinstance(tab, Mapping) or not isinstance(pane, Mapping):
+            raise ControllerError("tab creation returned no stable tab and root pane identity")
+        tab_id = tab.get("tab_id")
+        pane_id = pane.get("pane_id")
+        terminal_id = pane.get("terminal_id")
+        if not all(isinstance(value, str) and value for value in (tab_id, pane_id, terminal_id)):
+            raise ControllerError("tab creation returned an incomplete runtime identity")
+
+        def probe_start() -> Any:
+            matches = [
+                agent for agent in self.herdr.list_agents()
+                if agent.get("name") == agent_name
+            ]
+            if not matches:
+                return False
+            if len(matches) != 1 or matches[0].get("pane_id") != pane_id:
+                return None
+            return {"agent": matches[0]}
+
+        started = self.execute_launch_intent(
+            operation_id,
+            generation,
+            intent_id=f"launch:{operation_id}:{generation}:start",
+            kind="start",
+            idempotency_key=f"{operation_id}:{generation}:start",
+            payload={"agent": agent_name, "pane": pane_id, "kind": "omp"},
+            effect=lambda: self.herdr.start_agent(agent_name, pane_id, kind="omp"),
+            probe=probe_start,
+        )
+        agent = started.get("agent", started)
+        if not isinstance(agent, Mapping):
+            raise ControllerError("agent start returned no stable agent identity")
+        session_id = agent.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ControllerError("agent start returned no session identity")
+        identity = OperationIdentity(
+            board=board,
+            repo=repo,
+            workspace=workspace,
+            tab=tab_id,
+            root_pane=pane_id,
+            terminal=terminal_id,
+            session=session_id,
+        )
+        operation = self.register(operation_id, generation, identity, evidence=evidence)
+        if operation.state == OperationState.REGISTERED:
+            operation = self.store.transition(
+                operation_id,
+                generation,
+                OperationState.LAUNCHING,
+                expected_state=OperationState.REGISTERED,
+                evidence="runtime registered before business prompt",
+                transition_id=f"launching:{operation_id}:{generation}",
+            )
+
+        def probe_prompt() -> Any:
+            return None
+
+        self.execute_launch_intent(
+            operation_id,
+            generation,
+            intent_id=f"launch:{operation_id}:{generation}:prompt",
+            kind="prompt",
+            idempotency_key=f"{operation_id}:{generation}:prompt",
+            payload={"agent": agent_name, "prompt": prompt},
+            effect=lambda: self.herdr.prompt_agent(agent_name, prompt),
+            probe=probe_prompt,
+        )
+        return self.store.transition(
+            operation_id,
+            generation,
+            OperationState.WORKING,
+            expected_state=OperationState.LAUNCHING,
+            evidence=evidence,
+            transition_id=f"working:{operation_id}:{generation}",
+        )
 
     def launch(
         self,
@@ -1060,7 +1207,7 @@ def _add_identity(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--state-db", required=True)
     parser.add_argument("--herdr-bin", default="herdr")
     parser.add_argument("--herdr-arg", action="append", default=[])
@@ -1073,6 +1220,17 @@ def _parser() -> argparse.ArgumentParser:
 
     _add_identity(commands.add_parser("register"))
     _add_identity(commands.add_parser("launch"))
+    launch_operation = commands.add_parser("launch-operation")
+    _add_operation(launch_operation)
+    launch_operation.add_argument("--board", required=True)
+    launch_operation.add_argument("--repo", required=True)
+    launch_operation.add_argument("--workspace", required=True)
+    launch_operation.add_argument("--cwd", required=True)
+    launch_operation.add_argument("--agent", required=True)
+    launch_operation.add_argument("--prompt", required=True)
+    launch_operation.add_argument("--label", required=True)
+    launch_operation.add_argument("--evidence", required=True)
+
 
     status = commands.add_parser("status")
     status.add_argument("operation_id")
@@ -1175,6 +1333,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.operation_id,
                 args.generation,
                 _identity_from_args(args),
+                evidence=args.evidence,
+            )
+        elif args.command == "launch-operation":
+            result = controller.launch_operation(
+                args.operation_id,
+                args.generation,
+                board=args.board,
+                repo=args.repo,
+                workspace=args.workspace,
+                cwd=_absolute(args.cwd, "--cwd"),
+                agent_name=args.agent,
+                prompt=args.prompt,
+                label=args.label,
                 evidence=args.evidence,
             )
         elif args.command == "status":
