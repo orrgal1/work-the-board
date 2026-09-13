@@ -43,13 +43,34 @@ class LeaseDisposition(str, Enum):
     RELEASED = "released"
     EXPIRED = "expired"
 
-
 class CloseDisposition(str, Enum):
     PENDING = "pending"
     CLOSED = "closed"
     MISSING = "missing"
     DEFERRED = "deferred"
     REFUSED = "refused"
+
+
+class LaunchIntentStatus(str, Enum):
+    PENDING = "pending"
+    COMMITTED = "committed"
+    AMBIGUOUS = "ambiguous"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class LaunchIntent:
+    intent_id: str
+    operation_id: str
+    generation: int
+    kind: str
+    idempotency_key: str
+    payload: str
+    status: LaunchIntentStatus
+    outcome: Optional[str]
+    evidence: Optional[str]
+    created_at: float
+    updated_at: float
 
 
 class OperationStoreError(RuntimeError):
@@ -325,6 +346,23 @@ CREATE INDEX IF NOT EXISTS close_intents_operation
 CREATE UNIQUE INDEX IF NOT EXISTS close_intents_pending
     ON close_intents (operation_id, generation)
     WHERE disposition = 'pending';
+CREATE TABLE IF NOT EXISTS launch_intents (
+    intent_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('create', 'start', 'prompt')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'committed', 'ambiguous', 'failed')),
+    outcome TEXT,
+    evidence TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (operation_id, generation)
+        REFERENCES operations (operation_id, generation) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS launch_intents_operation
+    ON launch_intents (operation_id, generation, status, created_at);
 """
 
 
@@ -511,6 +549,97 @@ class OperationStore:
         sql += " ORDER BY o.operation_id, o.generation"
         with self._read() as connection:
             return [_operation(row) for row in connection.execute(sql, parameters)]
+    def prepare_launch_intent(
+        self,
+        operation_id: str,
+        generation: int,
+        intent_id: str,
+        kind: str,
+        idempotency_key: str,
+        payload: Mapping[str, Any],
+    ) -> LaunchIntent:
+        if kind not in {"create", "start", "prompt"}:
+            raise ValueError("launch intent kind must be create, start, or prompt")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        now = self._clock()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM launch_intents WHERE intent_id = ?",
+                (_required("intent_id", intent_id),),
+            ).fetchone()
+            if existing is not None:
+                intent = _launch_intent(existing)
+                if (
+                    intent.operation_id != operation_id
+                    or intent.generation != generation
+                    or intent.kind != kind
+                    or intent.idempotency_key != idempotency_key
+                    or intent.payload != encoded
+                ):
+                    raise LifecycleConflict("launch intent identity or payload conflict")
+                return intent
+            connection.execute(
+                """INSERT INTO launch_intents (
+                       intent_id, operation_id, generation, kind, idempotency_key,
+                       payload, status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                (
+                    intent_id,
+                    operation_id,
+                    generation,
+                    kind,
+                    idempotency_key,
+                    encoded,
+                    now,
+                    now,
+                ),
+            )
+            return self._launch_intent_row(connection, intent_id)
+
+    def get_launch_intent(self, intent_id: str) -> LaunchIntent:
+        with self._read() as connection:
+            return self._launch_intent_row(connection, _required("intent_id", intent_id))
+
+    def list_launch_intents(
+        self, operation_id: str, generation: int
+    ) -> list[LaunchIntent]:
+        with self._read() as connection:
+            return [
+                _launch_intent(row)
+                for row in connection.execute(
+                    """SELECT * FROM launch_intents
+                       WHERE operation_id = ? AND generation = ?
+                       ORDER BY created_at, intent_id""",
+                    (operation_id, generation),
+                )
+            ]
+
+    def record_launch_intent(
+        self,
+        intent_id: str,
+        status: LaunchIntentStatus,
+        *,
+        outcome: Optional[Mapping[str, Any]] = None,
+        evidence: Optional[str] = None,
+    ) -> LaunchIntent:
+        status = LaunchIntentStatus(status)
+        encoded = None if outcome is None else json.dumps(
+            outcome, sort_keys=True, separators=(",", ":")
+        )
+        with self._transaction() as connection:
+            intent = self._launch_intent_row(connection, intent_id)
+            if intent.status == LaunchIntentStatus.COMMITTED and status != intent.status:
+                return intent
+            if status == LaunchIntentStatus.COMMITTED and encoded is None:
+                raise ValueError("committed launch intent requires an outcome")
+            connection.execute(
+                """UPDATE launch_intents
+                   SET status = ?, outcome = COALESCE(?, outcome),
+                       evidence = COALESCE(?, evidence), updated_at = ?
+                   WHERE intent_id = ?""",
+                (status.value, encoded, evidence, self._clock(), intent_id),
+            )
+            return self._launch_intent_row(connection, intent_id)
 
     def transition(
         self,
@@ -1376,6 +1505,16 @@ class OperationStore:
         return intent
 
 
+    def _launch_intent_row(
+        self, connection: sqlite3.Connection, intent_id: str
+    ) -> LaunchIntent:
+        row = connection.execute(
+            "SELECT * FROM launch_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise OperationNotFound(f"launch intent {intent_id!r}")
+        return _launch_intent(row)
+
 def _required(name: str, value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -1419,6 +1558,20 @@ def _operation(row: sqlite3.Row) -> OperationRecord:
         registered_at=float(row["registered_at"]),
         updated_at=float(row["updated_at"]),
         state_evidence=row["state_evidence"],
+    )
+def _launch_intent(row: sqlite3.Row) -> LaunchIntent:
+    return LaunchIntent(
+        intent_id=row["intent_id"],
+        operation_id=row["operation_id"],
+        generation=int(row["generation"]),
+        kind=row["kind"],
+        idempotency_key=row["idempotency_key"],
+        payload=row["payload"],
+        status=LaunchIntentStatus(row["status"]),
+        outcome=row["outcome"],
+        evidence=row["evidence"],
+        created_at=float(row["created_at"]),
+        updated_at=float(row["updated_at"]),
     )
 
 

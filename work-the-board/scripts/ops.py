@@ -20,6 +20,7 @@ from operation_state import (
     CloseDisposition,
     CloseIntent,
     CloseNotEligible,
+    LaunchIntentStatus,
     LeaseDisposition,
     LifecycleConflict,
     OperationIdentity,
@@ -259,7 +260,72 @@ class OperationController:
         *,
         evidence: Optional[str] = None,
     ) -> OperationRecord:
+
         return self.store.register(operation_id, generation, identity, evidence=evidence)
+    def execute_launch_intent(
+        self,
+        operation_id: str,
+        generation: int,
+        *,
+        intent_id: str,
+        kind: str,
+        idempotency_key: str,
+        payload: Mapping[str, Any],
+        effect: Callable[[], Mapping[str, Any]],
+        probe: Callable[[], Any],
+    ) -> Mapping[str, Any]:
+        """Run one create/start/prompt with durable ambiguity recovery."""
+        intent = self.store.prepare_launch_intent(
+            operation_id, generation, intent_id, kind, idempotency_key, payload
+        )
+        if intent.status == LaunchIntentStatus.COMMITTED:
+            return json.loads(intent.outcome or "{}")
+        if intent.status == LaunchIntentStatus.AMBIGUOUS:
+            existing = probe()
+            if existing is None:
+                raise ControllerError(
+                    f"launch intent {intent_id!r} remains ambiguous; runtime outcome is unknown"
+                )
+            if existing is not False:
+                self.store.record_launch_intent(
+                    intent_id,
+                    LaunchIntentStatus.COMMITTED,
+                    outcome=existing,
+                    evidence="reconciled existing runtime outcome",
+                )
+                return existing
+            self.store.record_launch_intent(
+                intent_id,
+                LaunchIntentStatus.PENDING,
+                evidence="reconciliation proved runtime side effect absent",
+            )
+        if intent.status == LaunchIntentStatus.FAILED:
+            raise ControllerError(intent.evidence or f"launch intent {intent_id!r} failed")
+        try:
+            outcome = effect()
+        except BaseException as error:
+            self.store.record_launch_intent(
+                intent_id,
+                LaunchIntentStatus.AMBIGUOUS
+                if getattr(error, "committed", False)
+                else LaunchIntentStatus.FAILED,
+                evidence=str(error),
+            )
+            raise
+        if not isinstance(outcome, Mapping):
+            self.store.record_launch_intent(
+                intent_id,
+                LaunchIntentStatus.AMBIGUOUS,
+                evidence="launch adapter returned malformed outcome",
+            )
+            raise ControllerError("launch adapter returned a malformed outcome")
+        self.store.record_launch_intent(
+            intent_id,
+            LaunchIntentStatus.COMMITTED,
+            outcome=outcome,
+            evidence="launch side effect completed",
+        )
+        return outcome
 
     def launch(
         self,

@@ -14,9 +14,15 @@ sys.path.insert(0, str(FIXTURES))
 from fake_clock import FakeClock
 from fake_herdr import FakeHerdr
 from fake_reports import FakeReports
-from operation_state import LeaseDisposition, OperationIdentity, OperationState, ReportStatus
+from operation_state import (
+    LaunchIntentStatus,
+    LeaseDisposition,
+    OperationIdentity,
+    OperationState,
+    ReportStatus,
+)
 from operation_state import OperationStore
-from ops import OperationController, SafetyDisposition
+from ops import ControllerError, OperationController, SafetyDisposition
 
 
 class OperationFixture:
@@ -354,6 +360,92 @@ class OperationLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(case.herdr.get_tab(case.anchor_id))
         self.assertEqual(case.close_calls(), [])
 
+
+    def test_launch_intent_restart_reconciles_without_duplicate_and_retries_only_absence(self) -> None:
+        case = self.fixture("launch-intent")
+        calls = {"count": 0}
+
+        class CommittedAfterSideEffect(RuntimeError):
+            committed = True
+
+        def committed_effect() -> dict[str, str]:
+            calls["count"] += 1
+            raise CommittedAfterSideEffect("create committed before response")
+
+        with self.assertRaises(CommittedAfterSideEffect):
+            case.controller.execute_launch_intent(
+                case.operation_id,
+                1,
+                intent_id="create-intent",
+                kind="create",
+                idempotency_key="create-key",
+                payload={"label": "business-action"},
+                effect=committed_effect,
+                probe=lambda: None,
+            )
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(
+            case.store.get_launch_intent("create-intent").status,
+            LaunchIntentStatus.AMBIGUOUS,
+        )
+
+        restarted = OperationController(
+            OperationStore(str(case.store_path), clock=case.clock),
+            case.herdr,
+            reports=case.reports,
+            anchors={case.workspace_id: case.anchor_id},
+            clock=case.clock,
+        )
+        with self.assertRaises(ControllerError):
+            restarted.execute_launch_intent(
+                case.operation_id,
+                1,
+                intent_id="create-intent",
+                kind="create",
+                idempotency_key="create-key",
+                payload={"label": "business-action"},
+                effect=committed_effect,
+                probe=lambda: None,
+            )
+        self.assertEqual(calls["count"], 1)
+
+        outcome = {"tab_id": "tab-created"}
+        reconciled = restarted.execute_launch_intent(
+            case.operation_id,
+            1,
+            intent_id="create-intent",
+            kind="create",
+            idempotency_key="create-key",
+            payload={"label": "business-action"},
+            effect=committed_effect,
+            probe=lambda: outcome,
+        )
+        self.assertEqual(reconciled, outcome)
+        self.assertEqual(calls["count"], 1)
+
+        case.store.prepare_launch_intent(
+            case.operation_id,
+            1,
+            "retry-intent",
+            "start",
+            "retry-key",
+            {"label": "business-action"},
+        )
+        case.store.record_launch_intent(
+            "retry-intent", LaunchIntentStatus.AMBIGUOUS, evidence="response lost"
+        )
+        retried = restarted.execute_launch_intent(
+            case.operation_id,
+            1,
+            intent_id="retry-intent",
+            kind="start",
+            idempotency_key="retry-key",
+            payload={"label": "business-action"},
+            effect=lambda: {"started": "true"},
+            probe=lambda: False,
+        )
+        self.assertEqual(retried, {"started": "true"})
+        self.assertEqual(case.store.get_launch_intent("retry-intent").status, LaunchIntentStatus.COMMITTED)
 
 if __name__ == "__main__":
     unittest.main()
