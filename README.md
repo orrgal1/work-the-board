@@ -18,7 +18,9 @@ workspace manager.
 `work-the-board` runs `work-the-board/scripts/watch.sh` as a background process. Every
 cycle it counts issues labelled `mgr:in-flight`, selects the ready ones, claims a free
 slot's worth, and launches a session per issue that follows `next-issue`. Sessions plan
-and review through `plan-on-tier` / `review-on-tier`.
+and review through `plan-on-tier` / `review-on-tier` in that issue's coordinator; those
+requests never need an `op` wrapper. Only genuine no-diff operational work uses the
+durable operation lifecycle.
 
 The watcher also cleans up operation tabs it owns. An operation explicitly reports
 completion; the board delivers its result; an explicit keep-open request prevents cleanup.
