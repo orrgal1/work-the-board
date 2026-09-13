@@ -224,10 +224,14 @@ the request's ownership takes precedence over whether the work is read-only:
 | Basic answer, issue intake/dedupe, status report, or routing bookkeeping | No session | Answer or perform the bookkeeping directly; do not launch an issue or operation session |
 
 An issue-support request stays owned by the named issue even when it asks only for
-research, planning, investigation, or review. A dedicated process may be used when a
-provider-local tier requires it, but it retains the issue coordinator and planner/reviewer
-identity; do not add an `op` coordinator merely to host it. Use operation sessions only
-for genuine no-diff operational work, never as a generic wrapper for another route.
+research, planning, investigation, or review. If a provider-local tier requires a
+dedicated process, it may only replace or resume that issue coordinator in the same
+visible issue pane and session with the session-scoped provider overlay. Keep exactly
+one visible issue coordinator, use the real internal planner/reviewer child, and never
+launch an external or headless planner/reviewer, helper process, or `op` coordinator.
+The process retains the issue coordinator and planner/reviewer identity; do not add an
+`op` coordinator merely to host it. Use operation sessions only for genuine no-diff
+operational work, never as a generic wrapper for another route.
 
 Filing an issue or research item this way is bookkeeping, not work — it costs this
 session nothing and needs no session of its own.
