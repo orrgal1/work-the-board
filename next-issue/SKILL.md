@@ -230,10 +230,15 @@ git push -u origin issue-<N>-<slug>
 gh pr create --draft --fill --head issue-<N>-<slug> --base main --body "Closes #<N>"
 ```
 
+`Closes #<N>` is a placeholder body for now — step 5 states what it must grow into,
+and that this closing link must survive that rewrite, before the PR can be marked ready.
+
 ## 4. Work strictly inside the worktree
 
 Every read, edit, and command for this issue runs rooted at the worktree path — never
-the primary checkout. Do not touch files outside it. Do not merge or close anything yet.
+the primary checkout. Do not touch files outside it, other than a scratch file under
+`/tmp` (step 5 uses one for the PR body — deliberately outside the worktree so it can
+never be swept into a commit). Do not merge or close anything yet.
 
 Subagents are where this rule breaks: a relative path in a subagent's tool call resolves against this session's base cwd — the primary checkout — not against whatever worktree its brief names. Twice this has written superseded drafts into a primary checkout and blocked its next `git pull --ff-only` there. So every subagent brief — builder, plan, or review — states the worktree as the absolute path recorded in step 2 and requires absolute paths in every file operation it hands out; a brief that names the worktree but passes relative paths is a bug, however clear its intent. The same risk applies to commands, not just file operations: a subagent running a shell command from its own base cwd — a stray `git commit`, a script — can land in the primary checkout without ever touching a file the porcelain compare below would catch, because it operates on git state instead, and can still break `git pull --ff-only` there. So every subagent brief also sets the working directory of every command it hands out to the worktree, or otherwise scopes that command to it explicitly — not just its file read/write paths.
 
@@ -264,9 +269,45 @@ Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the p
 
 ## 5. On "ready"
 
-Only when explicitly instructed:
+Only when explicitly instructed. Before running `gh pr ready`, bring the PR body up to
+the one standard this skill states for it: what changed and why, the root cause when the
+issue is a bug, how it was verified (the concrete observation made, not just a claim
+that verification happened), and anything noticed but deliberately not fixed or filed.
+No fixed headings are required — write it as prose, in whatever shape fits the change;
+the requirement is on content, not form. A reviewer, and later anyone reading the merged
+PR, must be able to understand the change from the PR page alone, without opening the
+squash commit — the PR body is the canonical record; a commit message may echo it but
+never replaces it.
+
+The body must still carry `Closes #<N>` (or another GitHub closing keyword). When a PR
+merges without this skill's own step 6 running — under `mgr:manual-approve`, an operator
+merges it later — that keyword is the only thing that closes the issue, and it cannot be
+recovered from the squash commit message afterward. This repo has already accumulated
+merged PRs missing it (see `work-the-board/SKILL.md` step 3, "Reconcile the board before
+starting"); do not repeat that with the fuller body this step now demands.
+
+If a later review round changes the diff or what was verified, update the body again
+before landing — a body describing a pre-review state is stale by the time it merges.
+
+Adopting an existing PR that already carries a substantive body from a prior session?
+Extend it to meet the standard above rather than overwriting it — seed the scratch file
+from the current body first, then edit that file before applying it:
 
 ```bash
+gh pr view <PR_N> --json body --jq .body > /tmp/pr-<PR_N>-body.md
+# edit /tmp/pr-<PR_N>-body.md to add whatever the standard above is still missing
+gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
+gh pr ready <PR_N>
+```
+
+Otherwise, write a fresh body to the scratch file so quoting doesn't mangle backticks,
+`$`, or `!` in the prose, then apply it:
+
+```bash
+cat > /tmp/pr-<PR_N>-body.md <<'EOF'
+<body meeting the requirement above, including "Closes #<N>">
+EOF
+gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
 gh pr ready <PR_N>
 ```
 
