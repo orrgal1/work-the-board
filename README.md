@@ -20,15 +20,16 @@ cycle it counts issues labelled `mgr:in-flight`, selects the ready ones, claims 
 slot's worth, and launches a session per issue that follows `next-issue`. Sessions plan
 and review through `plan-on-tier` / `review-on-tier`.
 
-One watcher tick also maintains registered one-off operations through
-`work-the-board/scripts/ops.py`. Operation state, restart-safe create/start/prompt
-intents, reports, acknowledgments, bounded retention leases, and close intents live in a
-`${XDG_STATE_HOME:-$HOME/.local/state}/work-the-board/operations.sqlite3` by default;
-set `WORK_THE_BOARD_OPERATION_STATE_DB` to another absolute path when the watcher,
-board session, and operation agents all use that same path. Runtime `idle`/`done` is
-never business completion. Automatic cleanup requires explicit completion, an
-acknowledged final report, expired or released retention, an exact live identity
-match, a separate workspace anchor, and a safe non-working agent state.
+The watcher also cleans up operation tabs it owns. An operation explicitly reports
+completion; the board delivers its result; an explicit keep-open request prevents cleanup.
+On the next tick, fresh ownership and agent-state checks precede ordinary Herdr tab close.
+Working, waiting, unknown, unrelated, anchor, and last-tab cases stay open.
+
+The registry persists across restarts at
+`${XDG_STATE_HOME:-$HOME/.local/state}/work-the-board/operations.sqlite3`; override it
+with `WORK_THE_BOARD_OPERATION_STATE_DB` consistently for the watcher and operations.
+Inspection and close are separate Herdr requests: the small intervening race is accepted,
+not an upstream API prerequisite.
 
 **Concurrency is yours to set and is never defaulted.** Say it when you start the board
 — "work the board, 3 at a time" — or the session asks before launching anything. It

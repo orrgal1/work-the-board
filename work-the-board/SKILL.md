@@ -233,6 +233,9 @@ ambiguous. `new-issue`'s own `gh` commands run unscoped, so `cd` into that board
 **Operation lifecycle.** Running the operation here blocks report delivery, so give it a
 visible tab and agent in the mapped repo workspace. `scripts/ops.py` is the authoritative
 registry and cleanup controller; shell status and an `op:` label are not lifecycle state.
+
+The rule is simple: track tabs the board owns, wait for explicit completion, deliver the
+result, respect a keep-open request, then check and close. Idle alone never means done.
 Use one durable database shared by the watcher, this board session, and every operation:
 
 ```bash
@@ -350,6 +353,11 @@ requires a fresh exact workspace/tab/pane/terminal/session/agent binding, one pa
 tab, a quiescent runtime, a separate live anchor, and more than one workspace tab. Missing,
 changed, working, blocked, or unreadable state fails closed. Legacy/user-created `op:`
 tabs are unregistered and never swept.
+
+After those checks, the controller calls ordinary `herdr tab close <TAB_ID>`. No new
+Herdr API is required. Another actor could change the tab between inspection and close;
+this small check/close race is an accepted tradeoff for the single-owner board.
+Uncertain state is left open for inspection rather than guessed.
 
 A failed operation remains visible after its failure report is acknowledged. Retire it
 only with explicit operator authorization:

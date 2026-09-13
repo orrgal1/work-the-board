@@ -196,11 +196,8 @@ class HerdrAdapter:
 
     def prompt_agent(self, name: str, prompt: str) -> Mapping[str, Any]:
         return self._command.call("agent", "prompt", name, prompt)
-    def close_tab(self, tab_id: str, **expected: Any) -> Mapping[str, Any]:
-        raise AdapterError(
-            "installed Herdr exposes no atomic guarded tab-close capability",
-            committed=False,
-        )
+    def close_tab(self, tab_id: str) -> Mapping[str, Any]:
+        return self._command.call("tab", "close", tab_id)
 
 
 class ReportAdapter:
@@ -952,24 +949,8 @@ class OperationController:
         if decision.disposition != SafetyDisposition.SAFE:
             self._record_preclose_decision(operation, intent, decision)
             return decision
-        expected_agent = None
-        if decision.snapshot is not None:
-            agents = [
-                item
-                for item in decision.snapshot.agents
-                if item.get("pane_id") == operation.identity.root_pane
-            ]
-            if len(agents) == 1 and isinstance(agents[0].get("name"), str):
-                expected_agent = agents[0]["name"]
         try:
-            self.herdr.close_tab(
-                operation.identity.tab,
-                expected_workspace_id=operation.identity.workspace,
-                expected_pane_id=operation.identity.root_pane,
-                expected_session_id=operation.identity.session,
-                expected_agent_name=expected_agent,
-                require_guard=True,
-            )
+            self.herdr.close_tab(operation.identity.tab)
         except BaseException as error:
             after = self.inspect_identity(
                 operation, require_quiescent=True, require_anchor=True

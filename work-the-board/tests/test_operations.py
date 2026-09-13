@@ -22,7 +22,7 @@ from operation_state import (
     ReportStatus,
 )
 from operation_state import OperationStore
-from ops import AdapterError, ControllerError, HerdrAdapter, OperationController, SafetyDisposition
+from ops import ControllerError, HerdrAdapter, OperationController, SafetyDisposition
 
 
 class OperationFixture:
@@ -512,22 +512,32 @@ class OperationLifecycleTests(unittest.TestCase):
             OperationState.CLOSED,
         )
 
-    def test_production_adapter_refuses_unguarded_close_without_invoking_herdr(self) -> None:
+    def test_production_adapter_closes_only_completed_reported_operation(self) -> None:
         case = self.fixture("adapter-close")
-        adapter = HerdrAdapter(
-            (
+        controller = OperationController(
+            case.store,
+            HerdrAdapter((
                 sys.executable,
                 str(FIXTURES / "fake_herdr.py"),
                 "--state",
                 str(case.herdr_path),
-            )
+            )),
+            reports=case.reports,
+            anchors={case.workspace_id: case.anchor_id},
+            clock=case.clock,
         )
-        with self.assertRaises(AdapterError):
-            adapter.close_tab(case.tab_id)
+        controller.tick()
+        self.assertEqual(case.store.get(case.operation_id, 1).state, OperationState.WORKING)
+        case.complete_and_acknowledge()
+        controller.tick()
+        controller.tick()
         refreshed = FakeHerdr(case.herdr_path, now=case.clock)
+        self.assertEqual(case.store.get(case.operation_id, 1).state, OperationState.CLOSED)
+        self.assertNotIn(case.tab_id, [tab["tab_id"] for tab in refreshed.list_tabs()])
+        self.assertIn(case.anchor_id, [tab["tab_id"] for tab in refreshed.list_tabs()])
         self.assertEqual(
-            [entry for entry in refreshed.log if entry["operation"] == "tab.close"],
-            [],
+            len([entry for entry in refreshed.log if entry["operation"] == "tab.close"]),
+            1,
         )
 
 if __name__ == "__main__":
