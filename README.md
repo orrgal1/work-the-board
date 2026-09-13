@@ -20,6 +20,16 @@ cycle it counts issues labelled `mgr:in-flight`, selects the ready ones, claims 
 slot's worth, and launches a session per issue that follows `next-issue`. Sessions plan
 and review through `plan-on-tier` / `review-on-tier`.
 
+One watcher tick also maintains registered one-off operations through
+`work-the-board/scripts/ops.py`. Operation state, reports, acknowledgments, bounded
+retention leases, and close intents live in a restart-safe SQLite registry at
+`${XDG_STATE_HOME:-$HOME/.local/state}/work-the-board/operations.sqlite3` by default;
+set `WORK_THE_BOARD_OPERATION_STATE_DB` to another absolute path when the watcher,
+board session, and operation agents all use that same path. Runtime `idle`/`done` is
+never business completion. Automatic cleanup requires explicit completion, an
+acknowledged final report, expired or released retention, an exact live identity
+match, a separate workspace anchor, and a safe non-working agent state.
+
 **Concurrency is yours to set and is never defaulted.** Say it when you start the board
 — "work the board, 3 at a time" — or the session asks before launching anything. It
 becomes the watcher's ceiling: each cycle it counts open issues labelled
@@ -73,7 +83,8 @@ for a in plan-tier1 plan-tier2 plan-tier3 review-tier1 review-tier2 review-tier3
 done
 ```
 
-Requires `gh` (authenticated), `jq`, `git`, and `herdr` on `PATH`. `plan-on-tier` and
+Requires Python 3 (standard library `sqlite3`), `gh` (authenticated), `jq`, `git`, and
+`herdr` on `PATH`. `plan-on-tier` and
 `review-on-tier` resolve each requested tier within the coordinator session's active
 provider. The coordinator must provide that provider and its provider-local tier selector
 in the handoff; a global `@tier1`/`@tier2`/`@tier3` role must not route a subagent to a

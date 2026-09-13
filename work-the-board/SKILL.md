@@ -230,65 +230,141 @@ repo, path, or explicit operator naming); ask which board only when it is genuin
 ambiguous. `new-issue`'s own `gh` commands run unscoped, so `cd` into that board's `path`
 (or pass `--repo <owner/repo>`) before running them.
 
-**Launching an operation session.** Running the operation here blocks this pane and stalls
-report delivery from the watcher, so hand it off the same way the watcher hands off an
-issue — a visible tab and agent the operator can watch and steer, not a hidden `task`
-subagent:
+**Operation lifecycle.** Running the operation here blocks report delivery, so give it a
+visible tab and agent in the mapped repo workspace. `scripts/ops.py` is the authoritative
+registry and cleanup controller; shell status and an `op:` label are not lifecycle state.
+Use one durable database shared by the watcher, this board session, and every operation:
 
 ```bash
-herdr tab create --workspace <WORKSPACE_ID> --cwd <BOARD_PATH> --no-focus
-herdr agent start <name> --kind omp --pane <PANE_ID>
-herdr tab rename <TAB_ID> "op: <short description>"
-herdr agent prompt <name> "<operator's request, verbatim>"
+OPS_PY="<absolute-skill-dir>/scripts/ops.py"
+STATE_DB="${WORK_THE_BOARD_OPERATION_STATE_DB:-${XDG_STATE_HOME:-$HOME/.local/state}/work-the-board/operations.sqlite3}"
+REPORT_TARGET="board"
+OPS=(python3 "$OPS_PY" --state-db "$STATE_DB" --report-recipient "$REPORT_TARGET")
 ```
 
-Operation sessions inherit the currently configured OMP default model. An explicit
-operator request for a different model or tier is the exception; pass that model after
-`--` when starting the agent. If a coordinator launches a requested `tier2`/`tier3`
-reviewer, the coordinator remains on the current default model; only that specialized
-reviewer receives the requested tier.
+Both paths must be absolute. The watcher uses the same default and accepts the same
+`WORK_THE_BOARD_OPERATION_STATE_DB` override. The SQLite registry survives watcher,
+workspace, and board-session restarts; never put it in `/tmp`, an installed skill tree, or
+a disposable issue worktree.
 
-`<WORKSPACE_ID>` is the same per-board/per-repo `workspace` config value `launch_issue`
-uses for that repo — never this board-watcher session's own workspace — so the op tab
-lands beside issue tabs in the repo's own workspace. It is available directly from the
-board config file (or, for the single positional-board form, is the workspace argument
-passed to `watch.sh` at startup). `<BOARD_PATH>` is the target repo's checkout — `path`
-in the config for a `repo` board, the mapped repo's `repos[]` entry for a `project`
-board, or `<project dir>` for a single positional board — the same directory issue tabs
-already land in via `--cwd "$item_path"`, so the operation pane opens in the repo it
-operates on instead of wherever this board session happens to be running.
+Allocate a unique opaque `<OPERATION_ID>` and start at generation `0`. A generation is one
+business operation and is final after completion. Additional work waits for that generation's
+safe close, then launches under a new generation; do not steer new work into a completed
+retained tab.
 
-Name it so it can't collide with an issue agent (`<board>-issue-<N>`) — e.g.
-`<board>-op-<short-slug>`. Do not `--wait` on the prompt; that would block this session's
-own loop. Relay whatever the operation session reports back to the operator when it
-arrives.
+**Launch and register.** Resolve `<BOARD>`, `<REPO>`, `<BOARD_PATH>`, and
+`<WORKSPACE_ID>` from the watcher's current board mapping. For a project board,
+`<REPO>` selects its `repos[]` row. Use the runtime workspace id from a recovery report,
+when present, rather than the stale config value.
 
-**Op-tab teardown.** This session owns closing the op tab — nothing else ever will, since
-the watcher's sweep only matches `<board>/issue-<N>:` and an `op:` label can never satisfy
-that. Note `<name>`/`<TAB_ID>`/`<PANE_ID>` together at launch so an op still open can be
-found again later (`herdr tab list` / `herdr agent list`, filtered by the
-`<board>-op-<slug>` name from above).
+```bash
+create_json=$(herdr tab create --workspace "$WORKSPACE_ID" --cwd "$BOARD_PATH" --no-focus)
+PANE_ID=$(jq -r '.result.root_pane.pane_id // empty' <<<"$create_json")
+TAB_ID=$(jq -r '.result.tab.tab_id // empty' <<<"$create_json")
+herdr agent start "$AGENT_NAME" --kind omp --pane "$PANE_ID"
+herdr tab rename "$TAB_ID" "op: <short description>"
+pane_json=$(herdr pane get "$PANE_ID")
+TERMINAL_ID=$(jq -r '.result.pane.terminal_id // empty' <<<"$pane_json")
+SESSION_ID=$(jq -r '.result.pane.session_id // .result.pane.agent_session.value // empty' <<<"$pane_json")
+"${OPS[@]}" launch "$OPERATION_ID" 0 \
+  --board "$BOARD" --repo "$REPO" --workspace "$WORKSPACE_ID" \
+  --tab "$TAB_ID" --pane "$PANE_ID" --terminal "$TERMINAL_ID" \
+  --session "$SESSION_ID" --evidence "runtime identity verified before prompt"
+herdr agent prompt "$AGENT_NAME" "<operator request verbatim, plus the lifecycle handoff below>"
+```
 
-After relaying a report, check `herdr pane get <PANE_ID>`:
+The root pane is `.result.root_pane.pane_id`. Registration must succeed before the
+business prompt is sent; otherwise no operation owns that tab. Agent names remain outside
+the issue namespace, for example `<board>-op-<slug>`. Operation agents inherit the current
+OMP default unless the operator explicitly requests another model. Do not wait on the
+business prompt from this board pane.
 
-| `agent_status` | Meaning | Action |
-|---|---|---|
-| `idle` or `done` | Operation finished | `herdr tab close <TAB_ID>` now |
-| `working` | Still running; this report may be interim | Leave the tab open; re-check on this session's next wake |
-| `blocked` | Waiting on the operator for an answer | Leave the tab open; relay what it needs and re-check after the operator responds |
-| `unknown`, no session file | Op agent died or never came up | Orphaned — close it, and say so once |
+The handoff includes the exact `OPS_PY`, `STATE_DB`, `REPORT_TARGET`, operation id, and
+generation. It requires the operation agent to publish every business transition through
+`ops.py`:
 
-A report is routinely sent from inside the op agent's own turn, so `agent_status` can still
-read `working` the instant after you relay it — that is not proof the operation is done.
-Re-check every op tab this rule left open on the next report, the next operator turn, and
-unconditionally at Stop (below); close it the first time its status reads `idle`/`done` —
-or orphaned, per the table above.
-Never close a tab that reads `working` or `blocked` — `blocked` means the operator hasn't
-answered it yet, not that the operation is finished.
-Before closing an op tab, note whether it is the **last** tab in that repo's workspace (`herdr
-workspace list` reports `tab_count`): closing it destroys the workspace, which is what the anchor
-tab in "Where panes live" exists to prevent.
+```bash
+"${OPS[@]}" transition "$OPERATION_ID" 0 waiting_user \
+  --evidence "waiting for operator answer" --transition-id "<stable-transition-id>"
+"${OPS[@]}" report "$OPERATION_ID" 0 "<REPORT_ID>" "<interim body>" --submit
+"${OPS[@]}" transition "$OPERATION_ID" 0 working \
+  --evidence "operator answered" --transition-id "<stable-transition-id>"
+"${OPS[@]}" complete "$OPERATION_ID" 0 "<FINAL_REPORT_ID>" "<final body>" \
+  --evidence "requested operation completed"
+# Or, on a real failure:
+"${OPS[@]}" fail "$OPERATION_ID" 0 "<FAILURE_REPORT_ID>" "<failure and recovery body>" \
+  --evidence "operation failed"
+```
+
+`working` and `waiting_user` are explicit business states. `idle`, `done`, `failed`,
+`dead`, or an authentication error from the terminal is only runtime evidence: it never
+means the requested task completed. A dead or failed runtime needs an explicit durable
+`fail` report describing recovery or retirement; never convert it to successful completion
+and never replay its business action automatically.
+
+**Report delivery and acknowledgment.** `complete` and `fail` atomically persist a final
+report before attempting delivery. The watcher retries reports that remain `pending`; a
+successful transport is only `submitted`. The board session relays the received `body`
+to the operator, then acknowledges the exact stable id, digest, generation, and recipient:
+
+```bash
+"${OPS[@]}" ack "$OPERATION_ID" 0 "$REPORT_ID" \
+  --digest "$REPORT_DIGEST" --recipient "$REPORT_TARGET" \
+  --evidence "relayed verbatim to the operator"
+```
+
+Never acknowledge before relay, from terminal status, or with a reconstructed digest.
+If no report target is configured, the report remains durable and pending; it is not
+implicitly delivered. Reusing the same report id/content is idempotent. A different body,
+generation, digest, or recipient is rejected. The transport cannot make the relay/ack
+crash gap exactly once, so use the stable report id to recognize a replay and acknowledge
+only after confirming the operator received that exact report.
+
+**Retention.** Retention is an explicit bounded lease, not “the agent is still alive.”
+Acquire it before completing when a reviewer or operator must keep the tab:
+
+```bash
+"${OPS[@]}" retain "$OPERATION_ID" 0 "$LEASE_ID" "$HOLDER" "$REASON" --ttl 86400
+"${OPS[@]}" release "$OPERATION_ID" 0 "$LEASE_ID" \
+  --evidence "holder released retention"
+```
+
+Use 24 hours by default and never grant more than 7 days (`604800` seconds) per explicit
+lease. Renewal uses a new lease id. Release addresses the exact lease and generation.
+Expiry only removes retention; it does not complete work or acknowledge a report.
+`working` and `waiting_user` remain protected after lease expiry.
+
+**Cleanup ownership and failure retirement.** Once per watcher cycle, outside every
+board's GitHub failure/backoff boundary, `watch.sh` runs:
+
+```bash
+python3 "$OPS_PY" --state-db "$STATE_DB" \
+  --report-recipient "$REPORT_TARGET" \
+  --anchor "<WORKSPACE_ID>=<ANCHOR_TAB_ID>" tick
+```
+
+Anchor arguments are rebuilt from the watcher's current runtime repo/workspace mappings;
+missing or ambiguous anchors disable cleanup for that workspace. `ops.py` closes only a
+registered `completed` generation whose final report is acknowledged and whose retention
+has released or expired, or a failed generation explicitly moved to `retiring`. It also
+requires a fresh exact workspace/tab/pane/terminal/session/agent binding, one pane in the
+tab, a quiescent runtime, a separate live anchor, and more than one workspace tab. Missing,
+changed, working, blocked, or unreadable state fails closed. Legacy/user-created `op:`
+tabs are unregistered and never swept.
+
+A failed operation remains visible after its failure report is acknowledged. Retire it
+only with explicit operator authorization:
+
+```bash
+"${OPS[@]}" retire "$OPERATION_ID" 0 --evidence "operator authorized failed-operation retirement"
+```
+
+The next tick applies the same identity, quiescence, anchor, and last-tab guards. Cleanup
+only closes the operation tab. It never closes a workspace, stops a process tree, removes
+a worktree or data, or replays an operation. A deployment/updater intended to survive the
+tab must already run under an independent persistent supervisor; shell backgrounding is
+not proof of independence.
 
 ## 7. Stop
 
-Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so an issue tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`. Any `op:` tab still open at this point is this session's own to close (see Op-tab teardown in step 6): close it now unless `herdr pane get <PANE_ID>` still reads `working` or `blocked` — name any tab left open for that reason as still running in the stop report so the operator knows it's theirs to steer or close from here.
+Stop the background process (`hub`, `op: "stop"`) and report the last observed in-flight count. Sessions close their own tabs on `done`, so an issue tab still open after stopping either belongs to a session still finishing its own work, or — if its agent never started (`agent_status: "unknown"`, no session file, per `herdr tab list`) — is a genuine orphan, safe to close by hand with `herdr tab close <TAB_ID>`. Do not status-sweep operation tabs at stop. Their lifecycle remains durable in `STATE_DB`; `working`, `waiting_user`, `failed`, retained, unacknowledged, and safety-deferred operations stay open, and eligible cleanup resumes on the next watcher tick. Use `"${OPS[@]}" list` to report their explicit states.

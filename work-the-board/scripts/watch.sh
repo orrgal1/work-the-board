@@ -85,6 +85,31 @@ POLL_SECONDS=30
 REPORT_TARGET=""
 MODE=supervised
 CONFIG_FILE=""
+
+# Operation lifecycle state must outlive this checkout and the watcher process.
+# A single absolute override lets the board session and operation agents address
+# the same durable registry without coupling it to an installed skill path.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || {
+  echo "watch.sh: cannot resolve its script directory" >&2
+  exit 2
+}
+OPS_PY="$SCRIPT_DIR/ops.py"
+if [ -n "${WORK_THE_BOARD_OPERATION_STATE_DB:-}" ]; then
+  OPERATION_STATE_DB=$WORK_THE_BOARD_OPERATION_STATE_DB
+elif [ -n "${XDG_STATE_HOME:-}" ]; then
+  OPERATION_STATE_DB="$XDG_STATE_HOME/work-the-board/operations.sqlite3"
+elif [ -n "${HOME:-}" ]; then
+  OPERATION_STATE_DB="$HOME/.local/state/work-the-board/operations.sqlite3"
+else
+  echo "watch.sh: HOME or XDG_STATE_HOME is required for durable operation state" >&2
+  exit 2
+fi
+case "$OPERATION_STATE_DB" in
+  /*) ;;
+  *) echo "watch.sh: WORK_THE_BOARD_OPERATION_STATE_DB must be an absolute path" >&2; exit 2 ;;
+esac
+[ -r "$OPS_PY" ] || { echo "watch.sh: operation controller is not readable: $OPS_PY" >&2; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "watch.sh: python3 is required for operation lifecycle maintenance" >&2; exit 2; }
 npos=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -726,6 +751,66 @@ report_raw() {
   herdr agent prompt "$REPORT_TARGET" "board watcher: $1" >/dev/null 2>&1 || true
 }
 report() { report_raw "[$CUR_NAME] $1"; }
+
+# Runs once per watcher cycle, outside every board's GitHub error boundary.
+# ops.py owns report retries, lease expiry, identity checks, and tab cleanup;
+# this wrapper supplies only watcher-wide delivery and the current runtime
+# workspace anchors. A failed or ambiguous maintenance pass is log-only and
+# can never change issue capacity, claims, selection, or either issue sweep.
+operation_maintenance() {
+  local tabs tabs_rc b bname map _repo _path ws anchor seen out rc material
+  local -a ops_args
+  ops_args=(--state-db "$OPERATION_STATE_DB")
+  [ -n "$REPORT_TARGET" ] && ops_args+=(--report-recipient "$REPORT_TARGET")
+
+  tabs=$(herdr tab list 2>/dev/null)
+  tabs_rc=$?
+  if [ "$tabs_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$tabs"; then
+    log "operation maintenance: could not read live tabs for anchor discovery; cleanup will fail closed this cycle"
+    tabs=""
+  fi
+
+  # BOARD_<i>_REPOMAP is authoritative after runtime workspace recovery.
+  # Only one exact, standard anchor for a board/workspace pair is accepted.
+  # Shared workspaces are emitted once; an absent or ambiguous anchor is
+  # deliberately omitted so ops.py refuses cleanup rather than guessing.
+  seen=""
+  b=0
+  while [ "$b" -lt "$NBOARDS" ]; do
+    bv "$b" NAME; bname=$bvv
+    bv "$b" REPOMAP; map=$bvv
+    while IFS=$'\t' read -r _repo _path ws; do
+      [ -n "$ws" ] || continue
+      [ -n "$seen" ] && grep -qxF "$ws" <<<"$seen" && continue
+      [ -n "$tabs" ] || continue
+      anchor=$(jq -r --arg ws "$ws" --arg label "$bname workspace anchor - do not close" '
+        [.result.tabs[]?
+         | select(.workspace_id == $ws and (.label // "") == $label)
+         | .tab_id]
+        | if length == 1 then .[0] else empty end' <<<"$tabs" 2>/dev/null)
+      [ -n "$anchor" ] || continue
+      ops_args+=(--anchor "$ws=$anchor")
+      seen=$(printf '%s\n%s' "$seen" "$ws")
+    done <<<"$map"
+    b=$((b + 1))
+  done
+
+  out=$(python3 "$OPS_PY" "${ops_args[@]}" tick 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "operation maintenance failed (will retry next cycle): $out"
+    return 0
+  fi
+  material=$(jq -r '
+    ((.expired_leases // 0) > 0)
+    or ((.submitted_reports // []) | length > 0)
+    or ((.report_errors // []) | length > 0)
+    or ((.closed_operations // []) | length > 0)
+    or ((.missing_operations // []) | length > 0)
+    or ((.refused_operations // []) | length > 0)' <<<"$out" 2>/dev/null)
+  [ "$material" = "true" ] && log "operation maintenance: $out"
+  return 0
+}
 
 trap 'log "watcher stopping"; report_raw "stopped.$BOARDS_SUMMARY"; exit 0' TERM INT
 
@@ -2494,6 +2579,8 @@ while true; do
     service_board "$b" || true
     b=$((b + 1))
   done
+
+  operation_maintenance
 
   # Backgrounded sleep + wait, so TERM/INT is handled immediately. A plain
   # `sleep "$POLL_SECONDS"` defers the trap until the sleep finishes, which
