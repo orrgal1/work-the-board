@@ -14,6 +14,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from enum import Enum
+from functools import wraps
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from operation_state import (
@@ -235,6 +236,14 @@ class CommandReportAdapter:
         return self._command.call("get", key)
 
 
+def _with_launch_lock(function: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(function)
+    def locked(self: Any, operation_id: str, *args: Any, **kwargs: Any) -> Any:
+        with self.store.launch_lock(operation_id):
+            return function(self, operation_id, *args, **kwargs)
+    return locked
+
+
 class OperationController:
     """Authoritative operation state transitions and conservative cleanup."""
 
@@ -264,7 +273,7 @@ class OperationController:
     ) -> OperationRecord:
 
         return self.store.register(operation_id, generation, identity, evidence=evidence)
-    def execute_launch_intent(
+    def _execute_launch_intent(
         self,
         operation_id: str,
         generation: int,
@@ -287,23 +296,17 @@ class OperationController:
             LaunchIntentStatus.AMBIGUOUS,
         }:
             existing = probe()
-            if existing is None:
+            if not isinstance(existing, Mapping):
                 raise ControllerError(
-                    f"launch intent {intent_id!r} remains ambiguous; runtime outcome is unknown"
+                    f"launch intent {intent_id!r} remains ambiguous; manual recovery required"
                 )
-            if existing is not False:
-                self.store.record_launch_intent(
-                    intent_id,
-                    LaunchIntentStatus.COMMITTED,
-                    outcome=existing,
-                    evidence="reconciled existing runtime outcome",
-                )
-                return existing
             self.store.record_launch_intent(
                 intent_id,
-                LaunchIntentStatus.PENDING,
-                evidence="reconciliation proved runtime side effect absent",
+                LaunchIntentStatus.COMMITTED,
+                outcome=existing,
+                evidence="reconciled existing runtime outcome",
             )
+            return existing
         if intent.status == LaunchIntentStatus.FAILED:
             raise ControllerError(intent.evidence or f"launch intent {intent_id!r} failed")
         claimed = self.store.claim_launch_intent(intent_id)
@@ -336,6 +339,7 @@ class OperationController:
             evidence="launch side effect completed",
         )
         return outcome
+    @_with_launch_lock
     def launch_operation(
         self,
         operation_id: str,
@@ -353,27 +357,20 @@ class OperationController:
         nonce_label = f"{label} [{operation_id}:{generation}]"
 
         def probe_create() -> Any:
-            tabs = [
-                tab for tab in self.herdr.list_tabs(workspace)
-                if tab.get("workspace_id") == workspace
-                and tab.get("label") == nonce_label
-            ]
-            if not tabs:
-                return False
-            if len(tabs) != 1:
-                return None
-            panes = self.herdr.list_panes(workspace, tabs[0].get("tab_id"))
-            if len(panes) != 1 or panes[0].get("cwd") != cwd:
-                return None
-            return {"tab": tabs[0], "root_pane": panes[0]}
+            # Labels and locations are mutable, not proof of ownership or absence.
+            # Without the create response, leave the tab for explicit recovery.
+            return None
 
-        created = self.execute_launch_intent(
+        created = self._execute_launch_intent(
             operation_id,
             generation,
             intent_id=f"launch:{operation_id}:{generation}:create",
             kind="create",
             idempotency_key=f"{operation_id}:{generation}:create",
-            payload={"workspace": workspace, "cwd": cwd, "label": nonce_label},
+            payload={
+                "board": board, "repo": repo, "workspace": workspace,
+                "cwd": cwd, "label": nonce_label, "agent": agent_name, "prompt": prompt,
+            },
             effect=lambda: self.herdr.create_tab(workspace, cwd, label=nonce_label),
             probe=probe_create,
         )
@@ -388,17 +385,27 @@ class OperationController:
             raise ControllerError("tab creation returned an incomplete runtime identity")
 
         def probe_start() -> Any:
+            live_pane = self.herdr.get_pane(pane_id)
+            if (
+                live_pane.get("workspace_id") != workspace
+                or live_pane.get("tab_id") != tab_id
+                or live_pane.get("terminal_id") != terminal_id
+            ):
+                raise ControllerError("launch pane identity changed")
             matches = [
                 agent for agent in self.herdr.list_agents()
-                if agent.get("name") == agent_name
+                if agent.get("pane_id") == pane_id
             ]
-            if not matches:
-                return False
-            if len(matches) != 1 or matches[0].get("pane_id") != pane_id:
+            if (
+                len(matches) != 1
+                or matches[0].get("name") != agent_name
+                or not self._session(matches[0])
+                or self._session(matches[0]) != self._session(live_pane)
+            ):
                 return None
             return {"agent": matches[0]}
 
-        started = self.execute_launch_intent(
+        started = self._execute_launch_intent(
             operation_id,
             generation,
             intent_id=f"launch:{operation_id}:{generation}:start",
@@ -411,9 +418,12 @@ class OperationController:
         agent = started.get("agent", started)
         if not isinstance(agent, Mapping):
             raise ControllerError("agent start returned no stable agent identity")
-        session_id = agent.get("session_id")
+        session_id = self._session(agent)
         if not isinstance(session_id, str) or not session_id:
             raise ControllerError("agent start returned no session identity")
+        verified = probe_start()
+        if verified is None or self._session(verified["agent"]) != session_id:
+            raise ControllerError("started agent does not match live pane/session identity")
         identity = OperationIdentity(
             board=board,
             repo=repo,
@@ -437,7 +447,7 @@ class OperationController:
         def probe_prompt() -> Any:
             return None
 
-        self.execute_launch_intent(
+        self._execute_launch_intent(
             operation_id,
             generation,
             intent_id=f"launch:{operation_id}:{generation}:prompt",
@@ -670,6 +680,8 @@ class OperationController:
         report = matches[0]
         if digest != report.digest:
             raise ControllerError("acknowledgment digest does not match the durable report")
+        if recipient != report.recipient:
+            raise ControllerError("acknowledgment recipient does not match the durable report")
         configured = getattr(self.reports, "recipient", None)
         if configured is not None and recipient != configured:
             raise ControllerError("acknowledgment recipient does not match the report adapter")

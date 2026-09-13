@@ -8,6 +8,7 @@ idempotent same-value path.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -401,9 +402,8 @@ class OperationStore:
         try:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
-            connection.execute("BEGIN IMMEDIATE")
             try:
-                connection.executescript(_SCHEMA)
+                connection.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
                 report_columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(reports)")
                 }
@@ -426,7 +426,33 @@ class OperationStore:
                 connection.execute(
                     "UPDATE reports SET recipient = board WHERE recipient = ''"
                 )
-                connection.execute("PRAGMA user_version = 2")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version < 3:
+                    connection.execute(
+                        """CREATE TABLE launch_intents_v3 (
+                            intent_id TEXT PRIMARY KEY,
+                            operation_id TEXT NOT NULL,
+                            generation INTEGER NOT NULL,
+                            kind TEXT NOT NULL CHECK (kind IN ('create', 'start', 'prompt')),
+                            idempotency_key TEXT NOT NULL UNIQUE,
+                            payload TEXT NOT NULL,
+                            status TEXT NOT NULL CHECK (status IN (
+                                'pending', 'executing', 'committed', 'ambiguous', 'failed'
+                            )),
+                            outcome TEXT, evidence TEXT,
+                            created_at REAL NOT NULL, updated_at REAL NOT NULL
+                        )"""
+                    )
+                    connection.execute(
+                        "INSERT INTO launch_intents_v3 SELECT * FROM launch_intents"
+                    )
+                    connection.execute("DROP TABLE launch_intents")
+                    connection.execute("ALTER TABLE launch_intents_v3 RENAME TO launch_intents")
+                    connection.execute(
+                        """CREATE INDEX launch_intents_operation
+                           ON launch_intents (operation_id, generation, status, created_at)"""
+                    )
+                    connection.execute("PRAGMA user_version = 3")
             except BaseException:
                 connection.rollback()
                 raise
@@ -434,6 +460,21 @@ class OperationStore:
                 connection.commit()
         finally:
             connection.close()
+
+    @contextmanager
+    def launch_lock(self, operation_id: str) -> Iterator[None]:
+        operation_id = _required("operation_id", operation_id)
+        suffix = hashlib.sha256(operation_id.encode()).hexdigest()
+        # Keep the inode stable; unlinking a lock permits two independent owners.
+        with open(f"{self.path}.launch-{suffix}.lock", "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise LifecycleConflict(f"operation {operation_id!r} is already launching") from error
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -556,11 +597,32 @@ class OperationStore:
         idempotency_key: str,
         payload: Mapping[str, Any],
     ) -> LaunchIntent:
+        operation_id = _required("operation_id", operation_id)
+        generation = _generation(generation)
+        idempotency_key = _required("idempotency_key", idempotency_key)
         if kind not in {"create", "start", "prompt"}:
             raise ValueError("launch intent kind must be create, start, or prompt")
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         now = self._clock()
         with self._transaction() as connection:
+            current = self._current_row(connection, operation_id)
+            if current is not None:
+                latest = int(current["generation"])
+                if generation < latest:
+                    raise StaleGeneration(operation_id, generation, latest)
+                if generation > latest and current["state"] not in {"closed", "missing"}:
+                    raise LifecycleConflict("previous operation generation is still active")
+            reserved = connection.execute(
+                "SELECT MAX(generation) FROM launch_intents WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()[0]
+            if reserved is not None:
+                if generation < reserved:
+                    raise StaleGeneration(operation_id, generation, reserved)
+                if generation > reserved and (
+                    current is None or int(current["generation"]) < reserved
+                ):
+                    raise LifecycleConflict("previous launch is unresolved")
             existing = connection.execute(
                 "SELECT * FROM launch_intents WHERE intent_id = ?",
                 (_required("intent_id", intent_id),),
@@ -576,6 +638,8 @@ class OperationStore:
                 ):
                     raise LifecycleConflict("launch intent identity or payload conflict")
                 return intent
+            if kind == "create" and current is not None and generation == int(current["generation"]):
+                raise LifecycleConflict("registered generation has no matching launch reservation")
             connection.execute(
                 """INSERT INTO launch_intents (
                        intent_id, operation_id, generation, kind, idempotency_key,
@@ -929,7 +993,7 @@ class OperationStore:
             raise ValueError("report claim deadline must be finite and in the future")
         with self._transaction() as connection:
             report = self._require_report(
-                connection, operation_id, generation, report_id, current=True
+                connection, operation_id, generation, report_id, current=False
             )
             if report.status != ReportStatus.PENDING:
                 return None
@@ -959,7 +1023,7 @@ class OperationStore:
         owner = _required("owner", owner)
         with self._transaction() as connection:
             report = self._require_report(
-                connection, operation_id, generation, report_id, current=True
+                connection, operation_id, generation, report_id, current=False
             )
             if report.claim_owner not in {None, owner}:
                 raise LifecycleConflict(
@@ -985,7 +1049,7 @@ class OperationStore:
         submission_id = _required("submission_id", submission_id)
         with self._transaction() as connection:
             report = self._require_report(
-                connection, operation_id, generation, report_id, current=True
+                connection, operation_id, generation, report_id, current=False
             )
             if claim_owner is not None and report.claim_owner != claim_owner:
                 raise LifecycleConflict(
@@ -1017,7 +1081,7 @@ class OperationStore:
         acknowledgment = _required("acknowledgment", acknowledgment)
         with self._transaction() as connection:
             report = self._require_report(
-                connection, operation_id, generation, report_id, current=True
+                connection, operation_id, generation, report_id, current=False
             )
             if report.status == ReportStatus.ACKNOWLEDGED:
                 if report.acknowledgment != acknowledgment:
@@ -1051,7 +1115,7 @@ class OperationStore:
         error = _required("error", error)
         with self._transaction() as connection:
             report = self._require_report(
-                connection, operation_id, generation, report_id, current=True
+                connection, operation_id, generation, report_id, current=False
             )
             if report.status == ReportStatus.ACKNOWLEDGED:
                 raise LifecycleConflict(f"report {report_id!r} is already acknowledged")

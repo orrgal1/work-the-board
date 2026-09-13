@@ -269,11 +269,14 @@ when present, rather than the stale config value.
   --evidence "durable launch intents reconciled before business prompt"
 ```
 
-`launch-operation` durably journals tab creation, agent start, and the business prompt
-before each side effect. Restart reconciliation adopts a unique matching created tab or
-agent without repeating the action; ambiguity fails closed, and retry occurs only after
-the runtime snapshot proves the side effect absent. The operation identity is registered
-before the business prompt is sent.
+`launch-operation` reserves the generation and full request before any side effect.
+A process-held local lock prevents two invocations from launching the same operation.
+After a restart, a started agent can be recovered through its saved pane/terminal and
+live session identity. A lost create response or uncertain business prompt requires
+manual inspection; a mutable tab label or missing agent name never authorizes replay.
+Only a confirmed pre-commit rejection is automatically retryable. Registration must
+succeed before the business prompt. Resolve uncertain launches explicitly before starting
+another operation; do not blindly repeat their business request under a new id.
 
 The root pane is `.result.root_pane.pane_id`. Registration must succeed before the
 business prompt is sent; otherwise no operation owns that tab. Agent names remain outside
