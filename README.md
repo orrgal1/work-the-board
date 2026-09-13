@@ -74,6 +74,8 @@ done
 ```
 
 Requires `gh` (authenticated), `jq`, `git`, and `herdr` on `PATH`. `plan-on-tier` and
-`review-on-tier` resolve tiers 1-3 from `@tier1`/`@tier2`/`@tier3` in your `modelRoles`
-(`~/.omp/agent/config.yml`); if your config doesn't define those roles, add them first —
-the tier agents will fail to resolve a model without them.
+`review-on-tier` resolve each requested tier within the coordinator session's active
+provider. The coordinator must provide that provider and its provider-local tier selector
+in the handoff; a global `@tier1`/`@tier2`/`@tier3` role must not route a subagent to a
+different provider. If the active provider has no mapping for the requested tier, the
+coordinator reports the missing mapping instead of launching a cross-provider subagent.
