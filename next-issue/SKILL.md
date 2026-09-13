@@ -289,17 +289,6 @@ starting"); do not repeat that with the fuller body this step now demands.
 If a later review round changes the diff or what was verified, update the body again
 before landing — a body describing a pre-review state is stale by the time it merges.
 
-Write the body to a scratch file first so quoting doesn't mangle backticks, `$`, or `!`
-in the prose, then apply it:
-
-```bash
-cat > /tmp/pr-<PR_N>-body.md <<'EOF'
-<body meeting the requirement above, including "Closes #<N>">
-EOF
-gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
-gh pr ready <PR_N>
-```
-
 Adopting an existing PR that already carries a substantive body from a prior session?
 Extend it to meet the standard above rather than overwriting it — seed the scratch file
 from the current body first, then edit that file before applying it:
@@ -308,6 +297,18 @@ from the current body first, then edit that file before applying it:
 gh pr view <PR_N> --json body --jq .body > /tmp/pr-<PR_N>-body.md
 # edit /tmp/pr-<PR_N>-body.md to add whatever the standard above is still missing
 gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
+gh pr ready <PR_N>
+```
+
+Otherwise, write the body to a scratch file from scratch so quoting doesn't mangle
+backticks, `$`, or `!` in the prose, then apply it:
+
+```bash
+cat > /tmp/pr-<PR_N>-body.md <<'EOF'
+<body meeting the requirement above, including "Closes #<N>">
+EOF
+gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
+gh pr ready <PR_N>
 ```
 
 Run this repo's final review pass and its CI if invocable (`gh pr checks <PR_N> --watch`,
