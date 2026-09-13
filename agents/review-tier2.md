@@ -1,7 +1,6 @@
 ---
 name: review-tier2
 description: Reviews a concrete target at tier 2 (mid-strength model role). Read-only; writes no code.
-model: "@tier2"
 spawns: ""
 tools: "read, grep, glob, bash"
 ---

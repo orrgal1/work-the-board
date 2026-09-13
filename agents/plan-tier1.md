@@ -1,7 +1,6 @@
 ---
 name: plan-tier1
 description: Plans a request at tier 1 (fast/cheap model role). Read-only; writes no code.
-model: "@tier1"
 spawns: ""
 tools: "read, grep, glob, bash"
 ---
