@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Deterministic herdr model for operation-lifecycle fixtures.
+"""Deterministic Herdr model for watcher integration tests.
 
-The module is both an importable state model and a small herdr-shaped CLI.  It
-models identity and remote state only: no terminal, agent, or service process is
-started.  Every instance is isolated by its required caller-owned state file.
+The module is importable and exposes a small CLI-shaped surface. It models
+identity and remote state without starting terminals, agents, or processes.
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ from typing import Any, Callable, NoReturn
 
 
 AGENT_STATUSES = {"working", "blocked", "idle", "done", "failed", "dead", "unknown"}
-OPERATION_STATUSES = {"running", "waiting-user", "completed", "failed", "retired"}
 
 
 class HerdrFixtureError(RuntimeError):
@@ -64,12 +62,11 @@ def _initial_state(path: Path) -> dict[str, Any]:
         "namespace": namespace,
         "time": 0.0,
         "next_sequence": 1,
-        "counters": {"workspace": 1, "tab": 1, "pane": 1, "terminal": 1, "session": 1, "service": 1},
+        "counters": {"workspace": 1, "tab": 1, "pane": 1, "terminal": 1, "session": 1},
         "workspaces": {},
         "tabs": {},
         "panes": {},
         "agents": {},
-        "services": {},
         "failures": {},
         "log": [],
     }
@@ -125,7 +122,7 @@ class FakeHerdr:
     def _id(self, kind: str) -> str:
         number = self.state["counters"][kind]
         self.state["counters"][kind] = number + 1
-        prefix = {"workspace": "ws", "tab": "tab", "pane": "pane", "terminal": "term", "session": "session", "service": "service"}[kind]
+        prefix = {"workspace": "ws", "tab": "tab", "pane": "pane", "terminal": "term", "session": "session"}[kind]
         return f"{prefix}_{number}"
 
     def _record(
@@ -297,7 +294,6 @@ class FakeHerdr:
             "session_id": None,
             "agent_name": None,
             "agent_status": "unknown",
-            "operation_status": None,
         }
         self.state["tabs"][tab_id] = tab
         self.state["panes"][pane_id] = pane
@@ -353,9 +349,16 @@ class FakeHerdr:
             and (tab_id is None or pane["tab_id"] == tab_id)
         ]
 
-    def start_agent(self, name: str, pane_id: str, *, kind: str = "omp") -> dict[str, Any]:
+    def start_agent(
+        self,
+        name: str,
+        pane_id: str,
+        *,
+        kind: str = "omp",
+        omp_args: list[str] | None = None,
+    ) -> dict[str, Any]:
         operation = "agent.start"
-        inputs = {"name": name, "pane_id": pane_id, "kind": kind}
+        inputs = {"name": name, "pane_id": pane_id, "kind": kind, "omp_args": list(omp_args or ())}
         self._before(operation, inputs)
         if not name:
             raise IdentityMismatch("agent name is required")
@@ -372,8 +375,8 @@ class FakeHerdr:
             "tab_id": pane["tab_id"],
             "workspace_id": pane["workspace_id"],
             "session_id": session_id,
+            "cwd": pane["cwd"],
             "agent_status": "idle",
-            "operation_status": None,
         }
         self.state["agents"][name] = agent
         pane.update(session_id=session_id, agent_name=name, agent_status="idle")
@@ -417,80 +420,27 @@ class FakeHerdr:
         agent = self._agent(name)
         pane = self._pane(agent["pane_id"])
         agent["agent_status"] = pane["agent_status"] = "working"
-        if agent["operation_status"] is None:
-            agent["operation_status"] = pane["operation_status"] = "running"
         self._record(operation, inputs, "accepted", committed=True)
         self._save()
         self._after(operation, inputs)
         return copy.deepcopy(agent)
 
-    def set_status(
-        self,
-        pane_id: str,
-        *,
-        agent_status: str | None = None,
-        operation_status: str | None = None,
-    ) -> dict[str, Any]:
+    def set_status(self, pane_id: str, *, agent_status: str) -> dict[str, Any]:
         operation = "fixture.set_status"
-        inputs = {"pane_id": pane_id, "agent_status": agent_status, "operation_status": operation_status}
-        if agent_status is None and operation_status is None:
-            raise ValueError("at least one status is required")
-        if agent_status is not None and agent_status not in AGENT_STATUSES:
+        inputs = {"pane_id": pane_id, "agent_status": agent_status}
+        if agent_status not in AGENT_STATUSES:
             raise ValueError(f"unknown agent status: {agent_status}")
-        if operation_status is not None and operation_status not in OPERATION_STATUSES:
-            raise ValueError(f"unknown operation status: {operation_status}")
         pane = self._pane(pane_id)
+        pane["agent_status"] = agent_status
         agent = self.state["agents"].get(pane["agent_name"])
-        if agent_status is not None:
-            pane["agent_status"] = agent_status
-            if agent:
-                agent["agent_status"] = agent_status
-        if operation_status is not None:
-            pane["operation_status"] = operation_status
-            if agent:
-                agent["operation_status"] = operation_status
+        if agent:
+            agent["agent_status"] = agent_status
         self._record(operation, inputs, "updated", committed=True)
         self._save()
         return copy.deepcopy(pane)
 
-    def start_service(
-        self,
-        owner_pane_id: str,
-        *,
-        name: str,
-        persistent: bool = True,
-    ) -> dict[str, Any]:
-        pane = self._pane(owner_pane_id)
-        service_id = self._id("service")
-        service = {
-            "service_id": service_id,
-            "process_id": f"fixture:{self.state['namespace']}:{service_id}",
-            "name": name,
-            "owner_pane_id": owner_pane_id,
-            "owner_session_id": pane["session_id"],
-            "workspace_id": pane["workspace_id"],
-            "persistent": bool(persistent),
-            "running": True,
-            "detached": False,
-        }
-        self.state["services"][service_id] = service
-        self._record("service.start", {"owner_pane_id": owner_pane_id, "name": name, "persistent": persistent}, "started", committed=True)
-        self._save()
-        return copy.deepcopy(service)
 
-    def stop_service(self, service_id: str) -> dict[str, Any]:
-        try:
-            service = self.state["services"][service_id]
-        except KeyError as error:
-            raise NotFound(f"service not found: {service_id}") from error
-        service["running"] = False
-        service["stopped_reason"] = "explicit"
-        self._record("service.stop", {"service_id": service_id}, "stopped", committed=True)
-        self._save()
-        return copy.deepcopy(service)
 
-    def list_services(self) -> list[dict[str, Any]]:
-        return [copy.deepcopy(self.state["services"][key]) for key in sorted(self.state["services"])]
 
     def close_tab(
         self,
@@ -551,13 +501,6 @@ class FakeHerdr:
             if pane["agent_name"]:
                 agent_names.append(pane["agent_name"])
                 self.state["agents"].pop(pane["agent_name"], None)
-            for service in self.state["services"].values():
-                if service["owner_pane_id"] != pane_id or not service["running"]:
-                    continue
-                service["detached"] = True
-                if not service["persistent"]:
-                    service["running"] = False
-                    service["stopped_reason"] = "owner_tab_closed"
         workspace["tab_ids"].remove(tab_id)
         self.state["tabs"].pop(tab_id)
         workspace_destroyed = not workspace["tab_ids"]
@@ -681,14 +624,6 @@ def _build_parser() -> argparse.ArgumentParser:
     status = fixture_commands.add_parser("set-status")
     status.add_argument("pane_id")
     status.add_argument("--agent-status", choices=sorted(AGENT_STATUSES))
-    status.add_argument("--operation-status", choices=sorted(OPERATION_STATUSES))
-    service = fixture_commands.add_parser("start-service")
-    service.add_argument("pane_id")
-    service.add_argument("name")
-    service.add_argument("--transient", action="store_true")
-    stop_service = fixture_commands.add_parser("stop-service")
-    stop_service.add_argument("service_id")
-    fixture_commands.add_parser("services")
     failure = fixture_commands.add_parser("queue-failure")
     failure.add_argument("operation")
     failure.add_argument("--kind", choices=("api", "malformed", "timeout_after_success"), default="api")
@@ -703,7 +638,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    values = list(argv if argv is not None else os.sys.argv[1:])
+    omp_args: list[str] = []
+    if "--" in values:
+        command = values.index("agent") if "agent" in values else -1
+        if command >= 0 and values[command:command + 2] == ["agent", "start"]:
+            split = values.index("--")
+            omp_args = values[split + 1:]
+            values = values[:split]
+    args = _build_parser().parse_args(values)
     herdr = FakeHerdr(_state_path(args.state))
     try:
         if args.group == "workspace":
@@ -747,7 +690,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "list":
                 result = {"agents": herdr.list_agents()}
             elif args.command == "start":
-                result = {"agent": herdr.start_agent(args.name, args.pane, kind=args.kind)}
+                result = {
+                    "agent": herdr.start_agent(
+                        args.name, args.pane, kind=args.kind, omp_args=omp_args
+                    )
+                }
             elif args.command == "prompt":
                 result = {"agent": herdr.prompt_agent(args.name, args.prompt)}
             else:
@@ -762,19 +709,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             }
         elif args.command == "set-status":
-            result = {
-                "pane": herdr.set_status(
-                    args.pane_id,
-                    agent_status=args.agent_status,
-                    operation_status=args.operation_status,
-                )
-            }
-        elif args.command == "start-service":
-            result = {"service": herdr.start_service(args.pane_id, name=args.name, persistent=not args.transient)}
-        elif args.command == "stop-service":
-            result = {"service": herdr.stop_service(args.service_id)}
-        elif args.command == "services":
-            result = {"services": herdr.list_services()}
+            result = {"pane": herdr.set_status(args.pane_id, agent_status=args.agent_status)}
         elif args.command == "queue-failure":
             herdr.queue_failure(
                 args.operation,

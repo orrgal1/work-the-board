@@ -1,363 +1,96 @@
 ---
 name: next-issue
-description: "Pick the next ready GitHub issue, work it in an isolated git worktree behind a draft PR opened at start, and mark ready, land, or retire it on command. Use for 'work the next issue', 'ready', 'land', or 'done' instructions inside a build session."
+description: "Own one GitHub issue in an isolated worktree from claim through reviewed landing and cleanup."
 ---
 
 # Next Issue
 
-Own one issue end to end: select it, isolate it in a worktree, implement it there, then
-land or retire it only on explicit instruction.
+One visible coordinator owns one issue end to end. Use a plain Git worktree, open a draft
+PR before implementation, and never edit the primary checkout.
 
-## 1. Find the next available issue
+## 1. Select and claim
 
-```bash
-gh issue list --state open --limit 200 --json number,title,labels,body
-```
+When the watcher hands over an already-claimed issue, verify `mgr:in-flight` (repo mode)
+or `In progress` (project mode) and continue. Standalone selection uses open issues with
+none of `mgr:in-flight`, `mgr:hold`, or `research`, whose `Blocked by:` dependencies are
+closed; choose `priority:high` first, then lowest number, and claim immediately. In
+project mode the watcher alone changes Status.
 
-Ready = open, carrying none of `mgr:in-flight`, `mgr:hold`, `research`, and every
-`Blocked by: #N` reference either absent or itself closed. Order: `priority:high` first,
-then lowest issue number. If nothing is ready, report why (all blocked / all in-flight /
-all held / none open) and stop — do not invent one.
+Adopt an existing issue branch/PR when present; do not create duplicates.
 
-**Board is a GitHub Project?** Readiness is the Status field instead of labels: `Todo`
-is the ready pool, `In progress` is in flight, `Blocked` is a hold. The `research` label,
-`mgr:manual-approve`, and the `Blocked by: #N` body rule still apply exactly as above.
-Inspect by hand with `gh project item-list <number> --owner <owner> --format json`.
+## 2. Isolate before editing
 
-Claim it immediately to prevent double-pick (repo mode only):
+Fetch the remote and create the branch from `origin/main`, not a possibly stale local
+`main`:
 
 ```bash
-gh issue edit <N> --add-label mgr:in-flight
+git -C <primary> fetch origin main
+git -C <primary> worktree add <worktree> -b issue-<N>-<slug> origin/main
 ```
 
-In project mode, do not add or remove `mgr:in-flight` and do not touch Status yourself —
-the watcher is the only writer of Status. A session handed a project-board issue by the
-watcher does nothing at all to board state when claiming or releasing it. Running
-standalone against a project board with no watcher active: nothing will move the card,
-so say so plainly and let the operator set Status themselves.
-
-**Handed a specific issue?** If a caller (e.g. `work-the-board`) names the issue number
-as already claimed, skip this step (verify it still carries `mgr:in-flight` in repo mode,
-or `In progress` in project mode) and go straight to step 2.
-
-**Handed a tab by `work-the-board`?** With multi-board configs the watcher names the tab `<board>/issue-<N>: <title>` and the agent `<board>-issue-<N>` — use those exact names rather than deriving `issue-<N>` yourself. A watcher-launched session should always start inside the target repo's own herdr workspace, so it should land in the common case in step 2 below — but trust the workspace check there over this expectation if the two disagree; do not assume the fallback can't apply to you.
-
-## 2. Create the worktree and rename the tab
-
-Isolate the issue with a plain git worktree — never `herdr worktree create`, which always
-spins up a brand-new, separate herdr workspace as an unavoidable side effect and is
-exactly the bug this skill must not reintroduce:
+For adoption, attach the existing branch instead. Verify before proceeding:
 
 ```bash
-git -C <primary checkout path> worktree add <new checkout path> -b issue-<N>-<slug> main
+test "$(git -C <worktree> rev-parse --path-format=absolute --show-toplevel)" = "$(realpath <worktree>)"
+git -C <worktree> remote get-url origin
 ```
 
-Adopting an existing branch instead of cutting a fresh one? Base off that branch instead
-of `main`, same as before — only the mechanism changed, not the branch-selection logic:
+The origin must match the assigned repository. A mismatch means remove the worktree and
+recreate it from the correct primary; never repair it by changing a shared remote.
 
-```bash
-git -C <primary checkout path> worktree add <new checkout path> <existing-branch>
-```
+Record the absolute worktree path, plus the primary's `status --porcelain -uall` and
+`rev-parse HEAD`. Those values are the leak-detection baseline. Every command and every
+child brief uses the absolute worktree/cwd. Do not touch outside it except a PR-body file
+under `/tmp`.
 
-Immediately after either `worktree add` command above, verify the new worktree is
-actually parented to this repo before doing anything else with it. The real risk with
-plain `git worktree add` is a wrong `<primary checkout path>` — most likely when the
-pane is not yet in this repo's own workspace (the rare fallback below) — so the check
-must not itself depend on `<primary checkout path>`: comparing the new worktree back
-against the very value that built it never catches that value being wrong. Anchor
-instead on the repo identity you already know independently — the one you were told
-to work on (a board's configured `repo`, or the directory the operator pointed you
-at), never re-derived from the possibly-wrong `<primary checkout path>` value you
-substituted into the add command above:
+Keep the watcher-provided `<board>/issue-<N>: <title>` tab label. A confirmed standalone
+session uses `issue-<N>: <title>`. The issue pane belongs in the repository's configured
+primary Herdr workspace; the Git worktree has no Herdr workspace.
 
-```bash
-git -C <new checkout path> remote get-url origin
-```
+## 3. Open the draft PR
 
-A worktree shares its parent checkout's `.git/config`, so this origin names the
-*parent* repo — confirm it matches the repo you were told to work on, not some other
-repo the pane happened to be sitting in. Separately, confirm the path is a worktree
-root and not merely a directory nested inside one (upward directory discovery would
-otherwise let a stray leftover subdirectory pass the origin check too, since it
-inherits the same repo identity):
+Before implementation, push the branch and create a draft PR targeting `main` with
+`Closes #<N>`. If GitHub requires a commit, create an empty start commit; it is preferable
+to hiding in-progress work.
 
-```bash
-test "$(git -C <new checkout path> rev-parse --path-format=absolute --show-toplevel)" = "$(cd <new checkout path> && pwd -P)"
-```
+## 4. Implement and verify
 
-Treat a failed origin match, a failed toplevel match, or either command failing
-outright (stranded outside any repo entirely), as the same verdict: this
-worktree does not belong to this repo. Do not proceed with it, and do not commit,
-push, or file anything against it. Remove it by addressing the worktree itself, not
-the assumed primary — this resolves the owning repo through the worktree's own gitfile
-and works even when the worktree turned out to be parented to a different repo
-entirely:
+Work only in the worktree. For complex/high-risk work, use `plan-on-tier` first. Planning
+and review are genuine internal children of this coordinator; never start another OMP
+process, helper tab, operation session, or background/headless fallback.
 
-```bash
-git -C <new checkout path> worktree remove <new checkout path>
-```
+Fix the source, migrate callers, and remove obsolete paths. Verify the changed behavior
+proportionately. Before landing, use `review-on-tier`; fix every real finding and run a
+new full review round after material changes. In autonomous mode rounds 1-2 use the plan
+tier (tier 2 when no plan ran), with tier 3 from round 3 onward.
 
-If that itself fails because the path isn't a worktree at all (creation failed
-outright), delete the directory and run `git worktree prune` in whichever repo's
-`worktree list` still references it. Then re-create against the corrected primary
-checkout path and report the misplacement. If the corrected re-creation fails the same
-check again, stop and report — do not loop on repeated remove/re-create attempts.
+## 5. Ready and land
 
-**Never repair a misplaced worktree by rewriting its remote.** `git remote set-url`,
-`git remote add`, and similar are never valid repairs here, because a worktree shares
-its parent repository's `.git/config` — "fixing" the origin on a misplaced worktree
-actually rewrites the *primary* checkout's origin instead, and a following fetch can
-pull a foreign repo's refs into it (this has happened: it moved a primary checkout's
-`origin/main` to a different project's history entirely). The only valid repair is
-remove and re-create.
+Rewrite the PR body with what changed and why, root cause for bugs, concrete verification,
+unfixed observations, and `Closes #<N>`.
 
-The worktree verified, take two records now, before any implementation work, regardless of which tab case applies below:
+- With `mgr:manual-approve`: compare the primary against its baseline, mark ready, keep
+  the worktree and claim, report that approval is required, and stop.
+- Otherwise, when authorized (including an autonomous handoff): compare the primary,
+  mark ready, wait for invocable focused CI, squash-merge, confirm PR state is `MERGED`,
+  close the issue, and remove `mgr:in-flight`. Project mode leaves Status reconciliation
+  to the watcher.
 
-```bash
-realpath <new checkout path>                        # the absolute worktree path every subagent brief will carry
-git -C <primary checkout path> status --porcelain -uall   # the primary checkout's pre-existing dirt — the baseline
-git -C <primary checkout path> rev-parse HEAD              # the primary checkout's baseline HEAD
-```
+Do not review the landed commit, deploy, update the live watcher, add follow-up work, or
+pick another issue.
 
-Record `<new checkout path>` absolute because step 4 forbids relative paths in subagent briefs. The baseline is what "clean" means for this session: whatever it lists now was there before this session started and is not yours to touch — or to clean up — and the baseline HEAD is what "clean" means for the primary checkout's own history, the value it must still point to for the same reason. See "Leave the primary checkout as you found it" below.
+## 6. Protect the primary and clean up
 
-Before touching any tab, decide which of the two cases below applies — that decision is
-conceptually the first thing to do, ahead of any tab action, though the two `worktree
-add` commands at the top of this step are location-independent and may already have
-run regardless of which case applies.
+Before every terminal handoff—supervised completion, manual-approval wait, merge, explicit
+abandonment, and cleanup—compare primary status paths and HEAD with the recorded baseline.
+Never blanket restore, stash, clean, or reset the primary. Restore only a new path
+attributable to this session; leave and report unknown changes, vanished baseline paths,
+or a changed HEAD.
 
-**Common case — your pane is already inside the target repo's own workspace.** This is
-true for both a watcher-launched session and the ordinary human-started standalone
-session. No new tab and no new workspace are needed either way: just record `<new
-checkout path>`, root every subsequent read/edit/command there (see step 4), and rename
-the tab you are already running in.
-
-Which form to use is not a guess. A watcher-launched session's own herdr agent is named
-`<board>-issue-<N>` (see "Handed a tab by `work-the-board`?" above); look yourself up to
-read it back:
-
-```bash
-herdr agent list | jq -r --arg p "$HERDR_PANE_ID" --arg t "$HERDR_TAB_ID" \
-  '.result.agents[] | select(.pane_id == $p or .tab_id == $t) | .name'
-```
-
-- **Name ends `-issue-<number>`:** you are watcher-launched. `<board>` is that name with
-  the trailing `-issue-<number>` suffix stripped, whatever that number is — a relaunch or
-  an adopted/handed-off issue can carry a different number there than the one you are
-  working now, and the board name is still correct. Use the prefixed form below, labelled
-  with the issue number you are actually working.
-- **Name has no such suffix:** genuinely standalone, no board exists to name. Use the bare
-  form below.
-- **Lookup returns nothing, errors, or `herdr`/`jq` are unavailable:** unknown, not
-  standalone — a lookup that could not run is never evidence of "no board." Check
-  whether the tab already carries a canonical label instead: `herdr tab list` for
-  `$HERDR_TAB_ID` (in the fallback below, read this *before* the `pane move` — the Trap
-  after it means the post-move tab starts out with a bare number instead, not a usable
-  label). A label already shaped `<board>/issue-<n>: ...` means a board launched you, so
-  reuse that `<board>` and update only the title/issue number. Only a *successful*
-  lookup that found your own agent and showed no `-issue-<number>` suffix justifies the
-  bare form; if neither the lookup nor the existing label yields a board, stop and
-  report rather than pick.
-
-```bash
-# Watcher-launched session: <board> comes from the self-lookup (or existing label) above,
-# never guessed or left blank
-herdr tab rename "$HERDR_TAB_ID" "<board>/issue-<N>: <title>"
-
-# Standalone session (confirmed no board above): use the bare form
-herdr tab rename "$HERDR_TAB_ID" "issue-<N>: <TITLE>"
-```
-
-Get this right the first time: a tab left in the bare form when a board does own this
-session is invisible to that board's watcher `sweep_finished_tabs` (it only matches
-`<board>/issue-<N>:`, and only a lowercase/dash `<board>` at that — `watch.sh`'s own
-launch naming shares this constraint), and a tab in a primary workspace is unreachable by
-`sweep_orphan_worktrees` either way — exactly the label-matching failure this skill
-exists to avoid.
-
-**Rare fallback — your pane is NOT already inside the target repo's own workspace.**
-Check this first, before any tab action: compare `$HERDR_WORKSPACE_ID` against the
-repo's own primary workspace id, found with the same reasoning `watch.sh`'s startup
-validation uses — a workspace counts as the repo's own primary workspace when its
-checkout resolves to the repo's git root and it is not itself a linked worktree. The jq
-below does a plain string match, so resolve the canonical root first and substitute that
-(not a relative or symlinked path) for `<primary checkout path>`. The worktree guard
-above already ran before this point and validated `<primary checkout path>` against
-the worktree it produced, so this lookup is trusting a value that check has already
-covered, not a fresh unchecked one:
-
-```bash
-primary_root=$(git -C <primary checkout path> rev-parse --show-toplevel)
-herdr workspace list | jq -r --arg root "$primary_root" '.result.workspaces[] | select(.worktree.checkout_path == $root and .worktree.is_linked_worktree == false) | .workspace_id'
-```
-
-If `$HERDR_WORKSPACE_ID` differs from that id, relocate your own running pane there
-first:
-
-```bash
-herdr pane move "$HERDR_PANE_ID" --workspace <repo_workspace_id> --new-tab --no-focus
-```
-
-Then immediately re-apply the tab label from the move's own response — do this in the
-same breath, before anything else, using the same self-lookup as the common case above
-(run it before the move: `$HERDR_PANE_ID` survives the move, `$HERDR_TAB_ID` does not, so
-look up by whichever you still trust, but do it now — the move itself does not change the
-agent's `name`):
-
-```bash
-# Watcher-launched session: <board> = self agent name minus its trailing `-issue-<number>`
-# suffix (see common case above). Unknown/no-match still means stop and report, not bare.
-herdr tab rename <new-tab-id-from-move-result> "<board>/issue-<N>: <title>"
-
-# Standalone session (confirmed no board above): use the bare form
-herdr tab rename <new-tab-id-from-move-result> "issue-<N>: <TITLE>"
-```
-
-**Trap:** `pane move --new-tab` silently replaces whatever label the destination tab had
-with a bare number. Skip the immediate rename and the tab becomes invisible to every
-label-matching sweep. `$HERDR_PANE_ID` is always present as an env var inside a
-herdr-managed pane, but after the move `$HERDR_WORKSPACE_ID`/`$HERDR_TAB_ID` still name
-the OLD (pre-move) tab/workspace, not the new one — capture the new tab and workspace ids
-from the `pane move` response itself and use those going forward.
-
-## 3. Open a draft PR
-
-Push the branch and open a draft PR immediately, before any implementation work, so the
-issue has a visible in-progress artifact:
-
-```bash
-git push -u origin issue-<N>-<slug>
-gh pr create --draft --fill --head issue-<N>-<slug> --base main --body "Closes #<N>"
-```
-
-`Closes #<N>` is a placeholder body for now — step 5 states what it must grow into,
-and that this closing link must survive that rewrite, before the PR can be marked ready.
-
-## 4. Work strictly inside the worktree
-
-Every read, edit, and command for this issue runs rooted at the worktree path — never
-the primary checkout. Do not touch files outside it, other than a scratch file under
-`/tmp` (step 5 uses one for the PR body — deliberately outside the worktree so it can
-never be swept into a commit). Do not merge or close anything yet.
-
-Subagents are where this rule breaks: a relative path in a subagent's tool call resolves against this session's base cwd — the primary checkout — not against whatever worktree its brief names. Twice this has written superseded drafts into a primary checkout and blocked its next `git pull --ff-only` there. So every subagent brief — builder, plan, or review — states the worktree as the absolute path recorded in step 2 and requires absolute paths in every file operation it hands out; a brief that names the worktree but passes relative paths is a bug, however clear its intent. The same risk applies to commands, not just file operations: a subagent running a shell command from its own base cwd — a stray `git commit`, a script — can land in the primary checkout without ever touching a file the porcelain compare below would catch, because it operates on git state instead, and can still break `git pull --ff-only` there. So every subagent brief also sets the working directory of every command it hands out to the worktree, or otherwise scopes that command to it explicitly — not just its file read/write paths.
-
-When a subagent's first result comes back, confirm one file it claims to have written actually exists under `<new checkout path>` before building on it — a leak caught at the first slice costs one `read`; caught at the finish line it costs a re-run.
-
-## Leave the primary checkout as you found it
-
-The finish line for this session is any of: a supervised stop-and-report after pushing, closing the issue (landing in step 6, or abandoning in step 7), and removing the worktree in step 7. Before each, re-run the baseline commands from step 2 and compare:
-
-```bash
-git -C <primary checkout path> status --porcelain -uall
-git -C <primary checkout path> rev-parse HEAD
-```
-
-The comparison matches by path only, ignoring any status-code change on an already-baselined path — an operator staging a pre-existing modification mid-session is still baseline, not a new leak. Every path already in the baseline, by that path-only match, is pre-existing local state — someone's intentional edits, nothing to do with this issue — leave it alone.
-
-The comparison also re-checks the baseline HEAD and watches for a baselined path that has disappeared from the porcelain listing entirely. Either signals that a stray git command ran in the primary checkout during this session (see step 4) — a stray commit can move HEAD and, if it swept up a baseline-dirty path, remove that path from the listing too, so the comparison must not reason only about paths still present. Neither is auto-repaired: an operator's own mid-session pull also legitimately moves HEAD, and this session cannot tell the difference. Name the changed HEAD or the vanished path in the report instead, the same as any other unattributable state.
-
-A path new since the baseline is not automatically this session's fault: this session shares the primary checkout with an operator and other tools, and a third party can touch a file there for reasons unrelated to this issue while this session is alive. Restore only the new paths this session can actually attribute to itself — a path a subagent brief named, a path a subagent result claimed to have written, or a path one of this session's own commands touched. This matching compares tree-relative paths: a brief that named `<new checkout path>/src/foo.ts` attributes a leak that appears as `src/foo.ts` in the primary checkout's porcelain output. Naming a path in a brief is only evidence a leak was possible there, not that one occurred — before restoring a path attributed solely by brief-naming (not also by a subagent result's claim or by this session's own command having touched it), confirm the dirty content actually corresponds to this session's work, for example that it reads as a draft or variant of the corresponding worktree file's content. If it doesn't, it's a third party's edit, not a leak: leave it and name it in the report, the same as the other unattributable cases below. Restore each one by its exact path, and only those:
-
-```bash
-git -C <primary checkout path> checkout -- <path>    # tracked file modified or deleted
-rm <primary checkout path>/<path>                     # untracked file that appeared
-git -C <primary checkout path> restore --source=HEAD --staged --worktree -- <path>   # leak that got staged
-```
-
-Never `git checkout -- .`, `git restore .`, `git stash`, or `git clean` in the primary checkout: the baseline can hold intentional local edits unrelated to any issue (it has), and a blanket restore destroys them. A path that is in the baseline but that this session may also have written to, and a new-since-baseline path this session cannot attribute to itself (by brief, result, or command, or whose brief-named content doesn't correspond per above), both cannot be restored safely — leave each one and name it in the report instead, rather than assuming every non-baseline path is this session's leak. Name every path restored or deliberately left in the final report; a comparison showing nothing new needs no more than that it passed.
-
-## 5. On "ready"
-
-Only when explicitly instructed. Before running `gh pr ready`, bring the PR body up to
-the one standard this skill states for it: what changed and why, the root cause when the
-issue is a bug, how it was verified (the concrete observation made, not just a claim
-that verification happened), and anything noticed but deliberately not fixed or filed.
-No fixed headings are required — write it as prose, in whatever shape fits the change;
-the requirement is on content, not form. A reviewer, and later anyone reading the merged
-PR, must be able to understand the change from the PR page alone, without opening the
-squash commit — the PR body is the canonical record; a commit message may echo it but
-never replaces it.
-
-The body must still carry `Closes #<N>` (or another GitHub closing keyword). When a PR
-merges without this skill's own step 6 running — under `mgr:manual-approve`, an operator
-merges it later — that keyword is the only thing that closes the issue, and it cannot be
-recovered from the squash commit message afterward. This repo has already accumulated
-merged PRs missing it (see `work-the-board/SKILL.md` step 3, "Reconcile the board before
-starting"); do not repeat that with the fuller body this step now demands.
-
-If a later review round changes the diff or what was verified, update the body again
-before landing — a body describing a pre-review state is stale by the time it merges.
-
-Adopting an existing PR that already carries a substantive body from a prior session?
-Extend it to meet the standard above rather than overwriting it — seed the scratch file
-from the current body first, then edit that file before applying it:
-
-```bash
-gh pr view <PR_N> --json body --jq .body > /tmp/pr-<PR_N>-body.md
-# edit /tmp/pr-<PR_N>-body.md to add whatever the standard above is still missing
-gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
-gh pr ready <PR_N>
-```
-
-Otherwise, write a fresh body to the scratch file so quoting doesn't mangle backticks,
-`$`, or `!` in the prose, then apply it:
-
-```bash
-cat > /tmp/pr-<PR_N>-body.md <<'EOF'
-<body meeting the requirement above, including "Closes #<N>">
-EOF
-gh pr edit <PR_N> --body-file /tmp/pr-<PR_N>-body.md
-gh pr ready <PR_N>
-```
-
-Run this repo's final review pass and its CI if invocable (`gh pr checks <PR_N> --watch`,
-or trigger the workflow if it doesn't run automatically); if unavailable, say so plainly.
-
-## 6. On "land"
-
-Only when explicitly instructed, and after the primary-checkout comparison ("Leave the primary checkout as you found it") has been re-run after this session's own last file operation, immediately before merging:
-
-```bash
-gh pr merge <PR_N> --squash --delete-branch
-gh issue close <N> --comment "Landed in <PR_URL>."
-gh issue edit <N> --remove-label mgr:in-flight
-```
-
-Project mode: skip that last label removal — the watcher reconciles the closed issue's
-card to `Done` on its own.
-
-Confirm the merge succeeded (`gh pr view <PR_N> --json state`) before closing the issue.
-
-## 7. On "done"
-
-Only when explicitly instructed, and only after landing (or after being told to abandon
-the issue without landing — in that case remove `mgr:in-flight` and leave the issue open
-with a comment explaining why, before proceeding), and after running the primary-checkout
-comparison ("Leave the primary checkout as you found it") — this session's last chance to
-restore anything:
-
-```bash
-cd <primary checkout path>
-git -C <checkout path> worktree remove <checkout path>
-herdr tab close <TAB_ID>
-```
-
-Remove the worktree, then close the tab, in that order — a lingering tab looks like a
-live session. There is no separate worktree workspace to close: only the one tab this
-session has been running in the whole time (its id from the common case, or the
-move-result id from the fallback in step 2) needs closing. If unrecorded, `herdr tab
-list` and match against `^([a-z0-9-]+/)?issue-<N>:` — the same board-prefix-optional
-shape the watcher's own ownership checks use (`watch.sh`'s `agent_tab_owns_issue`), since
-a board-launched session's canonical label carries the `<board>/` prefix and a bare
-`issue-<N>:` search would miss it. Never close the tab or remove the worktree before
-landing unless told to abandon the issue.
-
-Note: `git worktree remove` addresses the checkout by its recorded `<checkout path>`,
-not by the session's live cwd, so the command itself does not care where it is run
-from — but this session's own cwd has been inside that checkout since step 4, and once
-the removal succeeds that directory is gone. Anything run afterward from a shell still
-sitting in it — including the very next `herdr tab close` above — would fail or behave
-oddly against a now-deleted cwd. `cd <primary checkout path>` first, as shown above,
-before running `git worktree remove`, so nothing that follows executes from a deleted
-directory.
+After confirmed landing, move command cwd back to the primary, remove the recorded
+worktree, then close this issue tab. For explicit abandonment, first comment the
+operator-authorized reason, leave the issue open, and remove `mgr:in-flight`; a real hold
+also gets `mgr:hold`. Project mode reports the disposition and leaves Status changes to
+the watcher. Under manual approval cleanup waits until the eventual landing session.
+Report PR/issue state, review findings and responses, verification evidence, primary
+comparison, and cleanup.
