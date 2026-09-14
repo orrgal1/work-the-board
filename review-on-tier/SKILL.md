@@ -1,59 +1,25 @@
 ---
 name: review-on-tier
-description: "Launch a dedicated code review subagent at an operator-chosen tier (1-3) and keep it open for iterative review discussion until the operator is satisfied. Use for 'tier 1/2/3 review' requests."
+description: "Launch one internal code-review subagent at an operator-chosen tier and keep it available for follow-up."
 ---
 
 # Review On Tier
 
-Launch one `review-tier<N>` subagent, in-session, and keep it alive so the operator can iterate.
+Use this skill for an explicit tier 1, 2, or 3 review. If no tier was supplied, ask.
 
-The coordinator's provider is authoritative. A tier changes capability within that
-provider; it must not select a globally configured model from another provider.
+## Dispatch
 
-## 1. Resolve and load the provider-local tier
+1. Confirm the current session has an executable provider-local mapping for
+   `review-tier<N>` before dispatch. Missing or cross-provider routing is a hard error:
+   report it and stop. Never downgrade, switch providers, or use another process.
+2. Launch one genuine internal `review-tier<N>` task with a stable name. Give it a
+   concrete diff, PR, branch, or file set and the behavior and risks to inspect.
+3. Accept the result only when task runtime metadata identifies the requested role and
+   expected provider/model. Prompt text and a role file are not routing evidence.
+4. Relay findings. Challenges and post-fix checks go to the same child with `hub`; a new
+   full review round gets a new independent child when the issue workflow requires one.
 
-Use the requested tier (1, 2, or 3) and the coordinator's actual provider/model
-metadata. Resolve that tier from the provider's configured mapping; never infer a
-model from the global `@tier<N>` role or from handoff prose. The mapping must be an
-actual model selector for the same provider, and a missing mapping is a hard error.
-
-Task agents are created before their prompt is delivered, so this cannot be fixed by
-putting the selector in the handoff. Before spawning, create a temporary config
-overlay containing only the executable override:
-
-```yaml
-task:
-  agentModelOverrides:
-    review-tier<N>: <resolved-provider-local-selector>
-```
-
-Checkpoint the coordinator, quit only its OMP process (leave the issue tab open), then
-resume the same session in the same pane and with the overlay loaded:
-
-```bash
-checkpoint
-/quit
-herdr agent start <same-agent-name> <same-pane-id> -- \
-  --resume <same-session-path> --config <temporary-overlay>
-```
-
-Do not create a helper tab/process or retry a failed provider. The overlay is
-session-scoped and must not modify global configuration. Confirm the child metadata
-reports the expected `resolvedModel` and provider before accepting the review; model
-role text, task text, and a successful process start are not evidence.
-
-## 2. Launch the review subagent
-
-Spawn `review-tier<N>` with a stable name so follow-up messages address the same child.
-The handoff states the provider and resolved selector for auditability, but the
-overlay above is the routing mechanism. Pass a concrete target and checks.
-
-## 3. Relay, iterate
-
-Relay the subagent's findings to the operator verbatim. On feedback, send it to that SAME
-subagent by name with `hub` `op: "send"` — a parked subagent keeps its history and wakes on
-a message — never spawn a second one for the same review.
-
-## 4. Stop
-
-Stop resuming once the operator says the review is done; nothing to tear down.
+The issue coordinator stays alive in its existing pane throughout. Review never starts
+an OMP process, agent process, helper tab, operation session, or headless/background
+fallback. Configuration must be loaded before internal task dispatch; the skill does not
+rewrite configuration or restart the coordinator to make a failed dispatch appear valid.

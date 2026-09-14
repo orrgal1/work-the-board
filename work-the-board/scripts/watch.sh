@@ -87,31 +87,8 @@ POLL_SECONDS=30
 REPORT_TARGET=""
 MODE=supervised
 CONFIG_FILE=""
+AGENT_CONFIG=${WORK_THE_BOARD_AGENT_CONFIG:-}
 
-# Operation lifecycle state must outlive this checkout and the watcher process.
-# A single absolute override lets the board session and operation agents address
-# the same durable registry without coupling it to an installed skill path.
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || {
-  echo "watch.sh: cannot resolve its script directory" >&2
-  exit 2
-}
-OPS_PY="$SCRIPT_DIR/ops.py"
-if [ -n "${WORK_THE_BOARD_OPERATION_STATE_DB:-}" ]; then
-  OPERATION_STATE_DB=$WORK_THE_BOARD_OPERATION_STATE_DB
-elif [ -n "${XDG_STATE_HOME:-}" ]; then
-  OPERATION_STATE_DB="$XDG_STATE_HOME/work-the-board/operations.sqlite3"
-elif [ -n "${HOME:-}" ]; then
-  OPERATION_STATE_DB="$HOME/.local/state/work-the-board/operations.sqlite3"
-else
-  echo "watch.sh: HOME or XDG_STATE_HOME is required for durable operation state" >&2
-  exit 2
-fi
-case "$OPERATION_STATE_DB" in
-  /*) ;;
-  *) echo "watch.sh: WORK_THE_BOARD_OPERATION_STATE_DB must be an absolute path" >&2; exit 2 ;;
-esac
-[ -r "$OPS_PY" ] || { echo "watch.sh: operation controller is not readable: $OPS_PY" >&2; exit 2; }
-command -v python3 >/dev/null 2>&1 || { echo "watch.sh: python3 is required for operation lifecycle maintenance" >&2; exit 2; }
 npos=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -318,6 +295,13 @@ def berrs($i):
            and ((($cfg.report_agent | istr)
                  and (($cfg.report_agent == "") or ($cfg.report_agent | clean))) | not)
         then [["ERR", "-", "report_agent", "must be a string without control characters or backslashes"]] else [] end)
+     + (if ($cfg.agent_config != null)
+           and ((($cfg.agent_config | clean) and ($cfg.agent_config | startswith("/"))) | not)
+        then [["ERR", "-", "agent_config", "must be an absolute readable configuration path"]] else [] end)
+     + (if (($cfg.boards | type) == "array")
+           and any($cfg.boards[]; (.mode // "supervised") == "auto")
+           and (($cfg.agent_config | nzstr) | not)
+        then [["ERR", "-", "agent_config", "required when any board uses auto mode"]] else [] end)
      + (if (($cfg.boards | type) != "array") or (($cfg.boards | length) == 0)
         then [["ERR", "-", "boards", "required, a non-empty array"]]
         else ([ $cfg.boards | to_entries[] | . as $e | ($e.value | berrs($e.key)) ] | add // [])
@@ -327,7 +311,7 @@ def berrs($i):
    end) as $errs
 | if ($errs | length) > 0 then $errs[] | @tsv
   else
-    (["CFG", (($cfg.poll_seconds // 30) | floor), ($cfg.report_agent // "")] | @tsv),
+    (["CFG", (($cfg.poll_seconds // 30) | floor)] | @tsv),
     ($cfg.boards[]
       | (if .kind == "repo"
          then ["BOARD", .name, "repo", .repo, .path, .workspace, (.concurrency | floor),
@@ -361,6 +345,9 @@ if [ -n "$CONFIG_FILE" ]; then
     echo "watch.sh: config: $CONFIG_FILE is not valid JSON" >&2
     exit 2
   fi
+  if [ -n "$AGENT_CONFIG" ]; then
+    CONFIG_JSON=$(jq -c --arg value "$AGENT_CONFIG" '.agent_config //= $value' <<<"$CONFIG_JSON")
+  fi
 else
   if [ -z "$WORKSPACE" ] || [ -z "$CONCURRENCY" ]; then
     echo "$USAGE" >&2
@@ -381,7 +368,7 @@ else
   CONFIG_JSON=$(jq -n \
     --arg ws "$WORKSPACE" --arg conc "$CONCURRENCY" --arg poll "$POLL_SECONDS" \
     --arg report "$REPORT_TARGET" --arg mode "$MODE" --arg kind "$POS_KIND" \
-    --arg repo "$POS_NWO" --arg path "$PWD" \
+    --arg repo "$POS_NWO" --arg path "$PWD" --arg agent_config "$AGENT_CONFIG" \
     --arg owner "$PROJECT_OWNER" --arg number "$PROJECT_NUMBER" '
     { poll_seconds: ($poll | tonumber? // $poll),
       boards: [
@@ -392,7 +379,8 @@ else
              else { owner: $owner, number: ($number | tonumber? // $number),
                     repos: [ { repo: $repo, path: $path, workspace: $ws } ] }
              end) ) ] }
-    + (if $report == "" then {} else { report_agent: $report } end)')
+    + (if $report == "" then {} else { report_agent: $report } end)
+    + (if $agent_config == "" then {} else { agent_config: $agent_config } end)')
 fi
 
 rows=$(jq -r "$CONFIG_VALIDATE" <<<"$CONFIG_JSON" 2>&1) || {
@@ -412,7 +400,13 @@ if grep -q '^ERR' <<<"$rows"; then
   exit 2
 fi
 
-IFS=$'\t' read -r _tag POLL_SECONDS REPORT_TARGET <<<"$(grep '^CFG' <<<"$rows")"
+IFS=$'\t' read -r _tag POLL_SECONDS <<<"$(grep '^CFG' <<<"$rows")"
+REPORT_TARGET=$(jq -r '.report_agent // ""' <<<"$CONFIG_JSON")
+AGENT_CONFIG=$(jq -r '.agent_config // ""' <<<"$CONFIG_JSON")
+if [ -n "$AGENT_CONFIG" ] && [ ! -r "$AGENT_CONFIG" ]; then
+  echo "watch.sh: config: agent_config: cannot read $AGENT_CONFIG" >&2
+  exit 2
+fi
 
 # Memoizes `git -C <path> rev-parse --show-toplevel` per checkout path across
 # every call this process makes (cache lives in ORPHAN_ROOT_CACHE, "<path>\t
@@ -754,65 +748,6 @@ report_raw() {
 }
 report() { report_raw "[$CUR_NAME] $1"; }
 
-# Runs once per watcher cycle, outside every board's GitHub error boundary.
-# ops.py owns report retries, lease expiry, identity checks, and tab cleanup;
-# this wrapper supplies only watcher-wide delivery and the current runtime
-# workspace anchors. A failed or ambiguous maintenance pass is log-only and
-# can never change issue capacity, claims, selection, or either issue sweep.
-operation_maintenance() {
-  local tabs tabs_rc b bname map _repo _path ws anchor seen out rc material
-  local -a ops_args
-  ops_args=(--state-db "$OPERATION_STATE_DB")
-  [ -n "$REPORT_TARGET" ] && ops_args+=(--report-recipient "$REPORT_TARGET")
-
-  tabs=$(herdr tab list 2>/dev/null)
-  tabs_rc=$?
-  if [ "$tabs_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$tabs"; then
-    log "operation maintenance: could not read live tabs for anchor discovery; cleanup will fail closed this cycle"
-    tabs=""
-  fi
-
-  # BOARD_<i>_REPOMAP is authoritative after runtime workspace recovery.
-  # Only one exact, standard anchor for a board/workspace pair is accepted.
-  # Shared workspaces are emitted once; an absent or ambiguous anchor is
-  # deliberately omitted so ops.py refuses cleanup rather than guessing.
-  seen=""
-  b=0
-  while [ "$b" -lt "$NBOARDS" ]; do
-    bv "$b" NAME; bname=$bvv
-    bv "$b" REPOMAP; map=$bvv
-    while IFS=$'\t' read -r _repo _path ws; do
-      [ -n "$ws" ] || continue
-      [ -n "$seen" ] && grep -qxF "$ws" <<<"$seen" && continue
-      [ -n "$tabs" ] || continue
-      anchor=$(jq -r --arg ws "$ws" --arg label "$bname workspace anchor - do not close" '
-        [.result.tabs[]?
-         | select(.workspace_id == $ws and (.label // "") == $label)
-         | .tab_id]
-        | if length == 1 then .[0] else empty end' <<<"$tabs" 2>/dev/null)
-      [ -n "$anchor" ] || continue
-      ops_args+=(--anchor "$ws=$anchor")
-      seen=$(printf '%s\n%s' "$seen" "$ws")
-    done <<<"$map"
-    b=$((b + 1))
-  done
-
-  out=$(python3 "$OPS_PY" "${ops_args[@]}" tick 2>&1)
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    log "operation maintenance failed (will retry next cycle): $out"
-    return 0
-  fi
-  material=$(jq -r '
-    ((.expired_leases // 0) > 0)
-    or ((.submitted_reports // []) | length > 0)
-    or ((.report_errors // []) | length > 0)
-    or ((.closed_operations // []) | length > 0)
-    or ((.missing_operations // []) | length > 0)
-    or ((.refused_operations // []) | length > 0)' <<<"$out" 2>/dev/null)
-  [ "$material" = "true" ] && log "operation maintenance: $out"
-  return 0
-}
 
 trap 'log "watcher stopping"; report_raw "stopped.$BOARDS_SUMMARY"; exit 0' TERM INT
 
@@ -883,7 +818,8 @@ READY_FILTER="$READY_RULES"'
 # --- repo backend: the original mgr:* label state machine -------------------
 
 repo_board_load() {
-  inflight_data=$(gh issue list -R "$CUR_REPO" --state open --label mgr:in-flight --json number,title \
+  inflight_data=$(gh issue list -R "$CUR_REPO" --state open --label mgr:in-flight \
+    --json number,title --limit "$CUR_CONC" \
     --jq '.[] | "'"$CUR_REPO"'\t\(.number)\t\(.title)"' 2>"$ERRFILE") || return 1
 }
 
@@ -1275,36 +1211,63 @@ title_for() { # <nwo> <num>
 # board-scoped pattern either. Such tabs still need a manual `herdr tab
 # rename`/close pass.
 sweep_finished_tabs() {
-  local tabs tab bname num r p state any_closed keep
+  local tab_json agent_json tabs tab bname num r p state any_closed keep agent_state worktrees
 
-  # Emit "<tab_id><TAB><board><TAB><issue number>" straight from jq. Do NOT
-  # parse the number out with sed: "\+" is a GNU extension that BSD sed
-  # (macOS) treats as a literal plus, so the number came back empty and
-  # nothing was ever swept — silently, because an empty number just skips
-  # the tab.
-  tabs=$(herdr tab list 2>/dev/null \
-         | jq -r '.result.tabs[]?
+  tab_json=$(herdr tab list 2>/dev/null) || return 0
+  agent_json=$(herdr agent list 2>/dev/null) || return 0
+  jq -e '.result.tabs | type == "array"
+         and all(.[];
+           type == "object"
+           and ((.tab_id | type) == "string" and (.tab_id | length) > 0)
+           and (.label == null or (.label | type == "string")))' \
+    >/dev/null 2>&1 <<<"$tab_json" || return 0
+  jq -e '.result.agents | type == "array"
+         and all(.[];
+           type == "object"
+           and ((.name | type) == "string" and (.name | length) > 0)
+           and ((.tab_id | type) == "string" and (.tab_id | length) > 0)
+           and ((.agent_status | type) == "string" and (.agent_status | length) > 0))' \
+    >/dev/null 2>&1 <<<"$agent_json" || return 0
+  jq -e --argjson tabs "$tab_json" '
+    all(.result.agents[];
+      .tab_id as $id
+      | any($tabs.result.tabs[]; .tab_id == $id))' \
+    >/dev/null 2>&1 <<<"$agent_json" || return 0
+
+  tabs=$(jq -r '.result.tabs[]?
                   | select(.label? // "" | test("^[a-z0-9-]+/issue-[0-9]+:"))
                   | (.label | capture("^(?<b>[a-z0-9-]+)/issue-(?<n>[0-9]+):")) as $m
-                  | "\(.tab_id)\t\($m.b)\t\($m.n)"')
+                  | "\(.tab_id)\t\($m.b)\t\($m.n)"' <<<"$tab_json")
   [ -z "$tabs" ] && return 0
 
   while IFS=$'\t' read -r tab bname num; do
     [ -z "$tab" ] || [ -z "$num" ] && continue
     [ "$bname" = "$CUR_NAME" ] || continue
 
+    agent_state=$(jq -r --arg tab "$tab" '
+      [.result.agents[]? | select(.tab_id == $tab) | .agent_status]
+      | if length == 0 then "absent"
+        elif length == 1 then .[0]
+        else "ambiguous"
+        end' <<<"$agent_json")
+    case "$agent_state" in absent|done|failed) ;; *) continue ;; esac
+
     keep=0
     any_closed=0
     while IFS=$'\t' read -r r p _ws; do
       [ -z "$r" ] && continue
-      # still holding a slot? then it is not finished
       grep -qxF "$r#$num" <<<"$inflight" && { keep=1; break; }
-      state=$(gh issue view "$num" -R "$r" --json state --jq '.state' 2>/dev/null)
+      if ! state=$(gh issue view "$num" -R "$r" --json state --jq '.state' 2>/dev/null); then
+        keep=1
+        break
+      fi
       case "$state" in
         OPEN) keep=1; break ;;
         CLOSED) any_closed=1 ;;
+        *) keep=1; break ;;
       esac
-      git -C "$p" worktree list 2>/dev/null | grep -qE "issue-$num([^0-9]|$)" && { keep=1; break; }
+      worktrees=$(git -C "$p" worktree list 2>/dev/null) || { keep=1; break; }
+      grep -qE "issue-$num([^0-9]|$)" <<<"$worktrees" && { keep=1; break; }
     done <<<"$CUR_REPOMAP"
     [ "$keep" -eq 1 ] && continue
     [ "$any_closed" -eq 1 ] || continue
@@ -1472,11 +1435,9 @@ agent_tab_owns_issue() { # <num> <tab_ids> <tab_label_map>
 # the three matches, in ANY workspace — this is what protects a session
 # whose own pane/agent identity lives in the repo's primary workspace while
 # the stray workspace under consideration sits elsewhere, the exact shape
-# that broke in the #25 incident. Fetching/parsing `herdr agent list`
-# failing fails the WHOLE sweep closed for this cycle (return 0
-# immediately), since without that data no candidate can be proven unowned;
-# a `herdr tab list` failure only degrades signal 3 (empty tab_label_map),
-# since signals 1 and 2 still stand guard.
+# that broke in the #25 incident. Failure or incomplete identity data from
+# either `herdr agent list` or `herdr tab list` fails the whole sweep closed
+# for the cycle: without both snapshots no candidate can be proven unowned.
 #
 # A FOURTH, independent guard (M4, restored #25 review round 2 B2): a live
 # agent whose pane sits INSIDE the candidate workspace itself (e.g. moved
@@ -1539,10 +1500,19 @@ $root	$r"
   # no write-once agent_ok temp).
   agent_out=$(herdr agent list 2>/dev/null)
   agent_rc=$?
-  if [ "$agent_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$agent_out"; then
+  if [ "$agent_rc" -ne 0 ] || ! jq -e '
+       .result.agents | type == "array"
+       and all(.[];
+         type == "object"
+         and ((.name | type) == "string" and (.name | length) > 0)
+         and ((.tab_id | type) == "string" and (.tab_id | length) > 0)
+         and ((.agent_status | type) == "string" and (.agent_status | length) > 0)
+         and (.cwd == null or (.cwd | type == "string"))
+         and (.foreground_cwd == null or (.foreground_cwd | type == "string")))' \
+       >/dev/null 2>&1 <<<"$agent_out"; then
     if skip_once "orphan-agent-list-failed"; then
-      log "orphan sweep: herdr agent list failed or returned invalid JSON — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
-      report "orphan sweep: herdr agent list failed or returned invalid JSON — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
+      log "orphan sweep: herdr agent list failed or returned incomplete identity data — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
+      report "orphan sweep: herdr agent list failed or returned incomplete identity data — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
     fi
     return 0
   fi
@@ -1550,15 +1520,34 @@ $root	$r"
   live_names=$(jq -r '.result.agents[]? | (.name // "")' <<<"$agent_out")
   live_tab_ids=$(jq -r '.result.agents[]? | (.tab_id // "")' <<<"$agent_out")
 
-  # Global tab-label map for signal 3 (agent_tab_owns_issue), fetched ONCE
-  # per sweep — same call shape sweep_finished_tabs already uses. A failure
-  # here only degrades signal 3 to no-match (empty map); it does not fail
-  # the whole sweep closed, since signals 1 and 2 above still stand guard.
-  tab_out=$(herdr tab list 2>/dev/null)
-  tab_label_map=""
-  if jq -e . >/dev/null 2>&1 <<<"$tab_out"; then
-    tab_label_map=$(jq -r '.result.tabs[]? | [.tab_id, (.label // "")] | @tsv' <<<"$tab_out")
+  # Global tab-label map is a required ownership signal. Incomplete identity
+  # data cannot authorize destructive cleanup.
+  if ! tab_out=$(herdr tab list 2>/dev/null); then
+    if skip_once "orphan-tab-list-failed"; then
+      log "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
+      report "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
+    fi
+    return 0
   fi
+  if ! jq -e '
+       .result.tabs | type == "array"
+       and all(.[];
+         type == "object"
+         and ((.tab_id | type) == "string" and (.tab_id | length) > 0)
+         and (.label == null or (.label | type == "string")))' \
+       >/dev/null 2>&1 <<<"$tab_out"; then
+    if skip_once "orphan-tab-list-failed"; then
+      log "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
+      report "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
+    fi
+    return 0
+  fi
+  tab_label_map=$(jq -r '.result.tabs[] | [.tab_id, (.label // "")] | @tsv' <<<"$tab_out")
+  jq -e --argjson tabs "$tab_out" '
+    all(.result.agents[];
+      .tab_id as $id
+      | any($tabs.result.tabs[]; .tab_id == $id))' \
+    >/dev/null 2>&1 <<<"$agent_out" || return 0
 
   while IFS=$'\t' read -r ws_id ws_checkout ws_root; do
     [ -z "$ws_id" ] && continue
@@ -1620,9 +1609,15 @@ $root	$r"
     # count.
     pane_out=$(herdr pane list --workspace "$ws_id" 2>/dev/null)
     pane_rc=$?
-    if [ "$pane_rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$pane_out"; then
+    if [ "$pane_rc" -ne 0 ] || ! jq -e '
+         .result.panes | type == "array"
+         and all(.[];
+           type == "object"
+           and ((.pane_id | type) == "string" and (.pane_id | length) > 0)
+           and ((.workspace_id | type) == "string" and (.workspace_id | length) > 0))' \
+         >/dev/null 2>&1 <<<"$pane_out"; then
       if skip_once "orphan-pane-list-failed:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): herdr pane list failed or returned invalid JSON — left untouched, cannot confirm no live agent"
+        log "orphan workspace $ws_id (issue #$num, $nwo): herdr pane list failed or returned incomplete identity data — left untouched, cannot confirm no live agent"
       fi
       continue
     fi
@@ -1891,6 +1886,7 @@ release_claim_if_owned() {
 launch_issue() {
   local nwo="$1" num="$2" title="$3"
   local name create_json pane tab start_out start_out_report attempt prompt err_code ws_retry
+  local -a start_args
   local pr_info pr_num pr_branch adopt branch_only item_path item_ws orig_ws
 
   # Cross-repo dispatch: every downstream call for this item — the tab and
@@ -1989,8 +1985,10 @@ launch_issue() {
   # Retry rather than discarding the tab on the first miss.
   attempt=0
   start_out=""
+  start_args=(agent start "$name" --kind omp --pane "$pane")
+  [ -n "$AGENT_CONFIG" ] && start_args+=(-- --config "$AGENT_CONFIG")
   while [ "$attempt" -lt 10 ]; do
-    if start_out=$(herdr agent start "$name" --kind omp --pane "$pane" 2>&1); then
+    if start_out=$(herdr "${start_args[@]}" 2>&1); then
       break
     fi
     case "$start_out" in
@@ -2649,7 +2647,8 @@ while true; do
     b=$((b + 1))
   done
 
-  operation_maintenance
+
+  [ "${WORK_THE_BOARD_ONCE:-0}" = "1" ] && break
 
   # Backgrounded sleep + wait, so TERM/INT is handled immediately. A plain
   # `sleep "$POLL_SECONDS"` defers the trap until the sleep finishes, which

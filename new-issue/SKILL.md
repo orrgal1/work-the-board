@@ -1,71 +1,32 @@
 ---
 name: new-issue
-description: "Intake a new GitHub build issue, check it against the current board, dedupe, and place it in its correct dependency lane. Use when the operator wants a new issue filed and slotted onto the board rather than just created."
+description: "Dedupe a requested GitHub issue and place it in the correct board lane."
 ---
 
 # New Issue
 
-Turn a raw request into one correctly placed, non-duplicate GitHub issue.
+Create one correctly placed issue from the operator's request.
 
-## 1. Intake
+## Intake and dedupe
 
-Take the operator's raw request verbatim: no summarizing, splitting, or writing
-acceptance criteria. The issue body is the request, unedited.
+Preserve the request verbatim as the issue body. Read the current open issues and likely
+closed matches; compare bodies, not titles alone.
 
-## 2. Examine the board
+- Existing near-identical open issue: add the request as a comment and do not create one.
+- Related but distinct work: create it, then cross-link both issues and name the overlap.
+- Otherwise create it normally.
 
-Pull current state before creating anything:
+## Dependencies and lanes
 
-```bash
-gh issue list --state open --limit 200
-gh issue list --state closed --limit 100
-```
+Add one `Blocked by: #N, #M` line only for prerequisites that must land first. Do not
+invent sequencing for convenience or rewrite another owner's issue.
 
-Read titles and bodies of plausible matches (`gh issue view <N>`), not just titles.
+- `research`: completion is a human decision/action rather than a diff; never auto-picked.
+- `mgr:hold`: waiting on an external answer or operator action; comment the reason.
+- Neither: ready for normal selection.
 
-## 3. Dedupe
+For a GitHub Project, add the issue to the project and set Status to `Todo`; use `Blocked`
+for a real hold. The watcher owns later Status transitions. `research`,
+`mgr:manual-approve`, and `Blocked by:` keep their normal meaning.
 
-- Exact or near match already open → do not create a new issue. Comment the request as a
-  note on the existing issue and stop.
-- Overlapping but distinct scope → create the issue, then comment a link to the related
-  issue(s) on both, noting the overlap. Leave closing/merging to the operator.
-- No match → create the issue normally.
-
-## 4. Place in its dependency lane
-
-Determine real prerequisites from the board — issues that must land first for this one
-to be buildable (shared files, interfaces, migrations, or explicit sequencing the
-operator stated). Then:
-
-- Depends on open issue(s): add `Blocked by: #N, #M` — all referenced numbers on that
-  single line. The board watcher takes every number found on `Blocked by:` lines; a
-  continuation line without that prefix is not parsed.
-- Open issues depend on it: comment the link on those issues (do not rewrite their
-  `Blocked by:` yourself unless you own them).
-- No real dependency: leave it unblocked; do not invent ordering for convenience.
-
-Also set the lane label if it applies — both keep the issue out of automatic pickup:
-
-- `research` — resolves by a human deciding, approving, or registering something, not by
-  a diff. Never auto-picked; dispatch it deliberately.
-- `mgr:hold` — nobody should build it yet (operator-owned, or waiting on an outside
-  answer). Blocks pickup, costs no concurrency slot. Always comment why.
-
-**Board is a GitHub Project?** Labels are not read for board state; add the issue and put
-it in the ready pool instead:
-
-```bash
-gh project item-add <number> --owner <owner> --url <issue url>
-```
-
-Then set its Status field to `Todo` via `gh project item-edit` (it needs the project,
-field, and single-select-option ids from
-`gh project field-list <number> --owner <owner> --format json`). `Blocked by:` on the
-body still expresses dependencies in both modes — the project has no dependency field the
-watcher reads. `gh project item-add`/`item-edit` need the `project` scope; if missing,
-`gh auth refresh -s project`.
-
-## Output
-
-Report: issue number/URL, dedupe verdict (created / merged-into-existing / linked-as-related),
-and the dependency lane it landed in (`Blocked by:` or none).
+Report the issue number/URL, dedupe result, related links, and dependency lane.
