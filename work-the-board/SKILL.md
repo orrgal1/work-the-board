@@ -40,9 +40,6 @@ Every configured `path` must be the repository's cleanly identified primary chec
 every `workspace` must be that checkout's primary Herdr workspace, not a linked worktree.
 Issue coordinators create plain Git worktrees but remain tabs in this workspace. Keep an
 anchor tab so Herdr does not destroy an otherwise empty workspace.
-Identify this board coordinator's current Herdr agent name, or register a unique one with
-`herdr agent rename <pane-id> <report-agent>`. Verify it resolves to this pane. Pass that
-exact name as `report_agent`; never assume a global `board` agent exists.
 
 Auto mode also requires one absolute readable OMP config containing executable
 provider-local mappings for every plan/review tier it may dispatch. Supply it as
@@ -50,22 +47,25 @@ provider-local mappings for every plan/review tier it may dispatch. Supply it as
 multi-board config. The watcher passes `--config` on the initial issue-coordinator start,
 including recovery launches; invalid or absent auto-mode configuration fails at startup.
 
-
 For one repo board:
 
 ```text
 hub start name=<repo>-work-the-board application=bash
-  args=[<skill-dir>/scripts/watch.sh,<workspace>,<concurrency>,30,<report-agent>,<mode>]
+  args=[<skill-dir>/scripts/watch.sh,<workspace>,<concurrency>,30,--mode,<mode>]
   env={WORK_THE_BOARD_AGENT_CONFIG:<absolute-agent-config>}
   cwd=<repo-path> restart=on-failure persist=true
 ```
 
-Append `--project <owner>/<number>` for project mode. For multiple boards, use
-`watch.sh --config <absolute-file>` with unique lowercase-dash names, top-level
-`report_agent` and `agent_config`, and per-board `kind`, `concurrency`, `mode`,
-repository path, and workspace. Project boards provide `owner`, `number`, and a
-non-empty `repos` mapping. The watcher validates paths, origins, workspaces, board
-fields, auto-mode agent configuration, and configuration shape before its first cycle.
+Append `--project <owner>/<number>` for project mode. The positional interface is
+`watch.sh <workspace> <concurrency> [poll_seconds] --mode supervised|auto
+[--project owner/number]`; `--mode` must be explicit and at most three positional
+arguments are accepted. Old four/five-positional report-target forms fail before any
+external call. For multiple boards, use `watch.sh --config <absolute-file>` with unique
+lowercase-dash names, top-level `agent_config`, and per-board `kind`, `concurrency`,
+`mode`, repository path, and workspace. A `report_agent` key is invalid even when null
+or empty. Project boards provide `owner`, `number`, and a non-empty `repos` mapping.
+The watcher validates paths, origins, workspaces, board fields, auto-mode agent
+configuration, and configuration shape before its first cycle.
 
 Use the harness process manager; never hand-roll or shell-background the watcher. Check
 startup logs and observe one cycle: `in-flight=<n> free=<n> ready=<n> launching=<n>`.
@@ -74,15 +74,20 @@ boards correctly launch nothing.
 
 ## Issue lifecycle
 
-Each launched prompt states the issue, adoption state, mode, and review/landing contract.
-Planning/review remain genuine internal children of that issue coordinator through
-`plan-on-tier` and `review-on-tier`. The board never starts an OMP planner/reviewer,
-helper tab, operation wrapper, dedicated process, or headless/background fallback.
-Provider-local role configuration must already be loaded; routing failure is surfaced.
+The watcher gives a newly created coordinator exactly one initial handoff stating the
+issue, adoption state, mode, and review/landing contract. Absent-owner recovery creates
+a fresh coordinator and likewise hands off exactly once. Planning/review remain genuine
+internal children of that issue coordinator through `plan-on-tier` and `review-on-tier`.
+The board never starts an OMP planner/reviewer, helper tab, operation wrapper, dedicated
+process, or headless/background fallback. Provider-local role configuration must already
+be loaded; routing failure is surfaced.
 
-The watcher reconciles live ownership, nudges idle coordinators toward reachable work,
-reports degraded/recovered boards, and closes only finished issue tabs whose issue is
-closed and worktree is gone. Ambiguous ownership or destructive cleanup fails closed.
+After that initial handoff, the watcher never injects prompts, send-keys, or composer
+input into an existing issue owner or the board. Existing coordinators retain completion
+responsibility. The watcher reconciles live ownership and closes only finished issue tabs
+whose issue is closed and worktree is gone. Ambiguous ownership or destructive cleanup
+fails closed. Degraded/recovered conditions are emitted only to passive watcher logs;
+operators observe those logs and process status through the harness process manager.
 A missing workspace may be re-resolved for the running process, but configuration remains
 a startup contract and must be corrected before restart.
 
@@ -95,6 +100,10 @@ a startup contract and must be corrected before restart.
 - Operational commands with no diff are outside this board system; do not invent an
   operation coordinator, state store, tab lifecycle, or daemon for them.
 
+Explicit communication requested by a human operator, including a supervised `ready`,
+`land`, or `done`, is operator input to the coordinator; it is not routine watcher
+automation.
+
 ## Controlled update and activation
 
 A merge does not update a running board. After the issue lands, the board owns activation:
@@ -106,9 +115,9 @@ A merge does not update a running board. After the issue lands, the board owns a
    Otherwise fast-forward only: `git merge --ff-only origin/main`. Never reset or clean.
 3. Refresh installed skill and agent symlinks/copies from the updated primary. Update the
    retained launch environment or board JSON with the absolute provider-local
-   `agent_config`; preserve concurrency, mode, workspaces, and the verified report agent.
-   Confirm the installed `watch.sh` and tier skills resolve to the merged revision and
-   the config contains every tier auto mode may request.
+   `agent_config`; preserve concurrency, mode, and workspaces. Confirm the installed
+   `watch.sh` and tier skills resolve to the merged revision and the config contains every
+   tier auto mode may request.
 4. Restart that same identified watcher with the corrected retained specification. A
    startup config failure leaves admissions paused; fix the specification rather than
    bypassing it. Observe startup and one real cycle, confirm concurrency/mode and existing

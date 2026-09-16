@@ -68,6 +68,7 @@ def _initial_state(path: Path) -> dict[str, Any]:
         "panes": {},
         "agents": {},
         "failures": {},
+        "argv_audit": [],
         "log": [],
     }
 
@@ -124,6 +125,10 @@ class FakeHerdr:
         self.state["counters"][kind] = number + 1
         prefix = {"workspace": "ws", "tab": "tab", "pane": "pane", "terminal": "term", "session": "session"}[kind]
         return f"{prefix}_{number}"
+
+    def record_argv(self, argv: list[str]) -> None:
+        self.state.setdefault("argv_audit", []).append(list(argv))
+        self._save()
 
     def _record(
         self,
@@ -294,6 +299,7 @@ class FakeHerdr:
             "session_id": None,
             "agent_name": None,
             "agent_status": "unknown",
+            "draft": "",
         }
         self.state["tabs"][tab_id] = tab
         self.state["panes"][pane_id] = pane
@@ -420,6 +426,7 @@ class FakeHerdr:
         agent = self._agent(name)
         pane = self._pane(agent["pane_id"])
         agent["agent_status"] = pane["agent_status"] = "working"
+        pane["draft"] = ""
         self._record(operation, inputs, "accepted", committed=True)
         self._save()
         self._after(operation, inputs)
@@ -439,7 +446,14 @@ class FakeHerdr:
         self._save()
         return copy.deepcopy(pane)
 
-
+    def set_draft(self, pane_id: str, draft: str) -> dict[str, Any]:
+        operation = "fixture.set_draft"
+        inputs = {"pane_id": pane_id, "draft": draft}
+        pane = self._pane(pane_id)
+        pane["draft"] = draft
+        self._record(operation, inputs, "updated", committed=True)
+        self._save()
+        return copy.deepcopy(pane)
 
 
     def close_tab(
@@ -540,6 +554,11 @@ class FakeHerdr:
     def log(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self.state["log"])
 
+    @property
+    def argv_audit(self) -> list[list[str]]:
+        return copy.deepcopy(self.state.get("argv_audit", []))
+
+
     def snapshot(self) -> dict[str, Any]:
         return copy.deepcopy(self.state)
 
@@ -549,6 +568,15 @@ def _state_path(value: str | None) -> str:
     if not path:
         raise SystemExit("--state or FAKE_HERDR_STATE is required")
     return path
+
+
+def _state_path_from_argv(values: list[str]) -> str:
+    for index, value in enumerate(values):
+        if value == "--state" and index + 1 < len(values):
+            return _state_path(values[index + 1])
+        if value.startswith("--state="):
+            return _state_path(value.partition("=")[2])
+    return _state_path(None)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -624,6 +652,9 @@ def _build_parser() -> argparse.ArgumentParser:
     status = fixture_commands.add_parser("set-status")
     status.add_argument("pane_id")
     status.add_argument("--agent-status", choices=sorted(AGENT_STATUSES))
+    draft = fixture_commands.add_parser("set-draft")
+    draft.add_argument("pane_id")
+    draft.add_argument("draft")
     failure = fixture_commands.add_parser("queue-failure")
     failure.add_argument("operation")
     failure.add_argument("--kind", choices=("api", "malformed", "timeout_after_success"), default="api")
@@ -639,6 +670,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     values = list(argv if argv is not None else os.sys.argv[1:])
+    herdr = FakeHerdr(_state_path_from_argv(values))
+    herdr.record_argv(values)
     omp_args: list[str] = []
     if "--" in values:
         command = values.index("agent") if "agent" in values else -1
@@ -710,6 +743,8 @@ def main(argv: list[str] | None = None) -> int:
             }
         elif args.command == "set-status":
             result = {"pane": herdr.set_status(args.pane_id, agent_status=args.agent_status)}
+        elif args.command == "set-draft":
+            result = {"pane": herdr.set_draft(args.pane_id, args.draft)}
         elif args.command == "queue-failure":
             herdr.queue_failure(
                 args.operation,
