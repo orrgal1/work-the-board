@@ -38,7 +38,9 @@ def issue(number):
 def labels(row):
     return [{"name": value} for value in row.get("labels", [])]
 
-if args[:2] == ["issue", "list"]:
+if args[:2] == ["repo", "view"]:
+    print(state["repo"])
+elif args[:2] == ["issue", "list"]:
     rows = [row for row in state["issues"] if row["state"] == "OPEN"]
     limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 30
     rows = rows[:limit]
@@ -124,7 +126,6 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.config = self.root / "board.json"
         self.config.write_text(json.dumps({
             "poll_seconds": 30,
-            "report_agent": "board-test",
             "agent_config": str(self.agent_config),
             "boards": [{
                 "name": "fixture", "kind": "repo", "repo": REPO,
@@ -132,13 +133,12 @@ class WatcherIntegrationTests(unittest.TestCase):
                 "concurrency": 1, "mode": "auto"
             }]
         }))
+        self.board_pane = anchor_pane
 
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def run_cycle(self, issues: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
-        prior = json.loads(self.gh_state.read_text()) if self.gh_state.exists() else {}
-        self.gh_state.write_text(json.dumps({"repo": REPO, "issues": issues, "log": prior.get("log", [])}))
+    def watcher_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.bin}:{env['PATH']}",
@@ -146,12 +146,107 @@ class WatcherIntegrationTests(unittest.TestCase):
             "FAKE_HERDR_STATE": str(self.herdr_state),
             "WORK_THE_BOARD_ONCE": "1",
         })
+        return env
+
+    def set_issues(self, issues: list[dict[str, object]]) -> None:
+        prior = json.loads(self.gh_state.read_text()) if self.gh_state.exists() else {}
+        self.gh_state.write_text(json.dumps({
+            "repo": REPO,
+            "issues": issues,
+            "log": prior.get("log", []),
+        }))
+
+    def run_watcher(
+        self,
+        args: list[str],
+        *,
+        issues: list[dict[str, object]] | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if issues is not None:
+            self.set_issues(issues)
+        env = self.watcher_env()
+        env.update(extra_env or {})
         return subprocess.run(
-            ["bash", str(WATCHER), "--config", str(self.config)],
+            ["bash", str(WATCHER), *args],
             cwd=self.repo, env=env, text=True, capture_output=True, timeout=20,
         )
 
+    def run_cycle(self, issues: list[dict[str, object]]) -> subprocess.CompletedProcess[str]:
+        return self.run_watcher(["--config", str(self.config)], issues=issues)
+
+    def input_mutations(self) -> list[list[str]]:
+        return [
+            argv
+            for argv in FakeHerdr(self.herdr_state).argv_audit
+            if any(
+                value == "prompt"
+                or value.startswith("composer")
+                or value.replace("_", "-").startswith("send-key")
+                for value in argv
+            )
+        ]
+
+    def prompts_for(self, name: str) -> list[list[str]]:
+        return [
+            argv
+            for argv in self.input_mutations()
+            if any(
+                argv[index:index + 3] == ["agent", "prompt", name]
+                for index in range(len(argv) - 2)
+            )
+        ]
+
+    def assert_only_fresh_handoff(self, name: str) -> None:
+        mutations = self.input_mutations()
+        self.assertEqual(mutations, self.prompts_for(name))
+        self.assertEqual(len(mutations), 1)
+
+    def seed_issue_owner(
+        self,
+        number: int,
+        *,
+        status: str,
+        draft: str,
+    ) -> dict[str, object]:
+        herdr = FakeHerdr(self.herdr_state)
+        created = herdr.create_tab(
+            "ws_main",
+            str(self.repo),
+            label=f"fixture/issue-{number}: existing",
+        )
+        pane_id = created["root_pane"]["pane_id"]
+        herdr.start_agent(f"fixture-issue-{number}", pane_id)
+        herdr.set_status(pane_id, agent_status=status)
+        herdr.set_draft(pane_id, draft)
+        return next(
+            row
+            for row in herdr.list_agents()
+            if row["name"] == f"fixture-issue-{number}"
+        )
+
+    def test_fake_herdr_audits_unsupported_input_mutation_before_parsing(self) -> None:
+        argv = [
+            "--state",
+            str(self.herdr_state),
+            "agent",
+            "send-keys",
+            "board-test",
+            "unsafe input",
+        ]
+        result = subprocess.run(
+            [sys.executable, str(FAKE_HERDR), *argv],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(FakeHerdr(self.herdr_state).argv_audit, [argv])
+        self.assertEqual(self.input_mutations(), [argv])
+
     def test_real_entrypoint_dispatches_only_ready_issue_and_preserves_gates(self) -> None:
+        herdr = FakeHerdr(self.herdr_state)
+        herdr.set_draft(self.board_pane, "BOARD DRAFT: dispatch")
         issues = [
             {"number": 1, "title": "held", "body": "", "labels": ["mgr:hold"], "state": "OPEN"},
             {"number": 2, "title": "research", "body": "", "labels": ["research"], "state": "OPEN"},
@@ -175,19 +270,23 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(starts[0]["inputs"]["omp_args"][-2:], ["--config", str(self.agent_config)])
         prompts = [row for row in herdr.log if row["operation"] == "agent.prompt"]
         issue_prompts = [row for row in prompts if row["inputs"]["name"] == "fixture-issue-4"]
-        board_prompts = [row for row in prompts if row["inputs"]["name"] == "board-test"]
         self.assertEqual(len(issue_prompts), 1)
-        self.assertTrue(board_prompts)
         self.assertIn("mgr:manual-approve", issue_prompts[0]["inputs"]["prompt"])
+        self.assert_only_fresh_handoff("fixture-issue-4")
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: dispatch")
         self.assertIn("in-flight=0 free=1 ready=2 launching=1", result.stdout)
 
     def test_restart_recovers_owner_and_closes_only_after_owner_finishes(self) -> None:
+        herdr = FakeHerdr(self.herdr_state)
+        herdr.set_draft(self.board_pane, "BOARD DRAFT: recovery")
         active = [{"number": 5, "title": "recover", "body": "", "labels": ["mgr:in-flight"], "state": "OPEN"}]
         first = self.run_cycle(active)
         self.assertEqual(first.returncode, 0, first.stderr)
         herdr = FakeHerdr(self.herdr_state)
         issue_agents = [row for row in herdr.list_agents() if row["name"] == "fixture-issue-5"]
         self.assertEqual(len(issue_agents), 1, first.stdout + first.stderr)
+        issue_agent = issue_agents[0]
+        herdr.set_draft(issue_agent["pane_id"], "ISSUE 5 DRAFT")
 
         second = self.run_cycle(active)
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -197,14 +296,20 @@ class WatcherIntegrationTests(unittest.TestCase):
             if row["operation"] == "agent.start" and row["inputs"]["name"] == "fixture-issue-5"
         ]
         self.assertEqual(len(starts), 1)
+        self.assert_only_fresh_handoff("fixture-issue-5")
+        self.assertEqual(herdr.get_pane(issue_agent["pane_id"])["draft"], "ISSUE 5 DRAFT")
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: recovery")
 
         finished = [{"number": 5, "title": "recover", "body": "", "labels": ["mgr:in-flight"], "state": "CLOSED"}]
         while_working = self.run_cycle(finished)
         self.assertEqual(while_working.returncode, 0, while_working.stderr)
         herdr = FakeHerdr(self.herdr_state)
-        issue_agent = next(row for row in herdr.list_agents() if row["name"] == "fixture-issue-5")
-        self.assertEqual(issue_agent["agent_status"], "working")
+        self.assertEqual(
+            next(row for row in herdr.list_agents() if row["name"] == "fixture-issue-5")["agent_status"],
+            "working",
+        )
         self.assertFalse(any(row["operation"] == "tab.close" for row in herdr.log))
+
         malformed = json.loads(self.herdr_state.read_text())
         malformed["agents"]["fixture-issue-5"]["tab_id"] = ""
         self.herdr_state.write_text(json.dumps(malformed))
@@ -214,10 +319,11 @@ class WatcherIntegrationTests(unittest.TestCase):
             row["operation"] == "tab.close"
             for row in FakeHerdr(self.herdr_state).log
         ))
-        malformed["agents"]["fixture-issue-5"]["tab_id"] = issue_agent["tab_id"]
-        self.herdr_state.write_text(json.dumps(malformed))
+        restored = json.loads(self.herdr_state.read_text())
+        restored["agents"]["fixture-issue-5"]["tab_id"] = issue_agent["tab_id"]
+        self.herdr_state.write_text(json.dumps(restored))
 
-
+        herdr = FakeHerdr(self.herdr_state)
         herdr.set_status(issue_agent["pane_id"], agent_status="done")
         after_done = self.run_cycle(finished)
         self.assertEqual(after_done.returncode, 0, after_done.stderr)
@@ -225,9 +331,11 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertFalse(any(row["name"] == "fixture-issue-5" for row in herdr.list_agents()))
         closes = [row for row in herdr.log if row["operation"] == "tab.close"]
         self.assertEqual(len(closes), 1)
+        self.assert_only_fresh_handoff("fixture-issue-5")
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: recovery")
         self.assertIn("closed finished tab", after_done.stdout)
 
-    def test_auto_mode_requires_loaded_config_and_uncertain_prompt_retains_owner(self) -> None:
+    def test_auto_mode_requires_loaded_config_and_timeout_never_reprompts_owner(self) -> None:
         config = json.loads(self.config.read_text())
         config.pop("agent_config")
         self.config.write_text(json.dumps(config))
@@ -236,11 +344,13 @@ class WatcherIntegrationTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
         self.assertIn("agent_config: required when any board uses auto mode", rejected.stderr)
         self.assertNotIn("mgr:in-flight", json.loads(self.gh_state.read_text())["issues"][0]["labels"])
+        self.assertEqual(FakeHerdr(self.herdr_state).argv_audit, [])
 
         config["agent_config"] = str(self.agent_config)
         self.config.write_text(json.dumps(config))
         herdr = FakeHerdr(self.herdr_state)
-        herdr.queue_failure("agent.prompt", "timeout_after_success", times=2, after_commit=True)
+        herdr.set_draft(self.board_pane, "BOARD DRAFT: timeout")
+        herdr.queue_failure("agent.prompt", "timeout_after_success", times=1, after_commit=True)
         uncertain = self.run_cycle(issue)
         self.assertEqual(uncertain.returncode, 0, uncertain.stderr)
         state = json.loads(self.gh_state.read_text())
@@ -252,27 +362,200 @@ class WatcherIntegrationTests(unittest.TestCase):
             row["operation"] == "tab.close" and row["inputs"]["tab_id"] == owner["tab_id"]
             for row in herdr.log
         ))
+        self.assert_only_fresh_handoff("fixture-issue-7")
 
-    def test_empty_report_recipient_does_not_consume_agent_config(self) -> None:
-        config = json.loads(self.config.read_text())
-        config.pop("report_agent")
-        self.config.write_text(json.dumps(config))
-        issue = [{"number": 8, "title": "no reporter", "body": "", "labels": [], "state": "OPEN"}]
-        result = self.run_cycle(issue)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        herdr.set_status(owner["pane_id"], agent_status="idle")
+        herdr.set_draft(owner["pane_id"], "ISSUE 7 DRAFT AFTER TIMEOUT")
+        restarted = self.run_cycle(state["issues"])
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
         herdr = FakeHerdr(self.herdr_state)
-        start = next(
-            row for row in herdr.log
-            if row["operation"] == "agent.start" and row["inputs"]["name"] == "fixture-issue-8"
+        retained = next(row for row in herdr.list_agents() if row["name"] == "fixture-issue-7")
+        self.assertEqual(retained["tab_id"], owner["tab_id"])
+        self.assertEqual(retained["agent_status"], "idle")
+        self.assertEqual(
+            herdr.get_pane(owner["pane_id"])["draft"],
+            "ISSUE 7 DRAFT AFTER TIMEOUT",
         )
-        self.assertEqual(start["inputs"]["omp_args"][-2:], ["--config", str(self.agent_config)])
-        self.assertFalse(any(
-            row["operation"] == "agent.prompt" and row["inputs"]["name"] == str(self.agent_config)
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: timeout")
+        self.assert_only_fresh_handoff("fixture-issue-7")
+
+    def test_json_report_agent_is_rejected_before_external_calls(self) -> None:
+        base = json.loads(self.config.read_text())
+        for value in ("board-test", "", None):
+            with self.subTest(report_agent=value):
+                config = dict(base)
+                config["report_agent"] = value
+                self.config.write_text(json.dumps(config))
+                result = self.run_cycle([])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("report_agent", result.stderr)
+                self.assertEqual(json.loads(self.gh_state.read_text())["log"], [])
+                self.assertEqual(FakeHerdr(self.herdr_state).argv_audit, [])
+
+    def test_positional_cli_requires_explicit_mode_and_rejects_old_report_forms(self) -> None:
+        self.set_issues([])
+        omitted_modes = [
+            ["ws_main", "1"],
+            ["ws_main", "1", "30"],
+        ]
+        for args in omitted_modes:
+            with self.subTest(omitted_mode_args=args):
+                result = self.run_watcher(args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("--mode supervised|auto", result.stderr)
+                self.assertEqual(json.loads(self.gh_state.read_text())["log"], [])
+                self.assertEqual(FakeHerdr(self.herdr_state).argv_audit, [])
+                self.assertEqual(self.input_mutations(), [])
+
+        old_forms = [
+            ["ws_main", "1", "30", "board-test"],
+            ["ws_main", "1", "30", "board-test", "auto"],
+            ["ws_main", "1", "30", "auto"],
+            ["ws_main", "1", "30", "supervised"],
+            ["ws_main", "1", "30", "auto", "supervised"],
+        ]
+        for args in old_forms:
+            with self.subTest(args=args):
+                result = self.run_watcher(args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(json.loads(self.gh_state.read_text())["log"], [])
+                self.assertEqual(FakeHerdr(self.herdr_state).argv_audit, [])
+
+        for mode in ("supervised", "auto"):
+            with self.subTest(explicit_mode=mode):
+                result = self.run_watcher(
+                    ["ws_main", "1", "30", "--mode", mode],
+                    extra_env={"WORK_THE_BOARD_AGENT_CONFIG": str(self.agent_config)},
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.input_mutations(), [])
+
+    def test_collaborative_idle_owner_and_board_are_never_mutated_across_restarts(self) -> None:
+        config = json.loads(self.config.read_text())
+        config["boards"][0]["concurrency"] = 2
+        self.config.write_text(json.dumps(config))
+        herdr = FakeHerdr(self.herdr_state)
+        herdr.set_draft(self.board_pane, "BOARD COLLABORATION DRAFT")
+        existing = self.seed_issue_owner(
+            10,
+            status="idle",
+            draft="ISSUE 10 COLLABORATION DRAFT",
+        )
+        issues = [
+            {"number": 10, "title": "collaborative", "body": "", "labels": ["mgr:in-flight"], "state": "OPEN"},
+            {"number": 11, "title": "fresh", "body": "", "labels": [], "state": "OPEN"},
+            {"number": 12, "title": "held", "body": "", "labels": ["mgr:hold"], "state": "OPEN"},
+            {"number": 13, "title": "research", "body": "", "labels": ["research"], "state": "OPEN"},
+            {"number": 14, "title": "dependent", "body": "Blocked by: #10", "labels": [], "state": "OPEN"},
+        ]
+
+        first = self.run_cycle(issues)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        state = json.loads(self.gh_state.read_text())
+        self.assertEqual(
+            [row["number"] for row in state["issues"] if "mgr:in-flight" in row["labels"]],
+            [10, 11],
+        )
+        herdr = FakeHerdr(self.herdr_state)
+        fresh = next(row for row in herdr.list_agents() if row["name"] == "fixture-issue-11")
+        herdr.set_draft(fresh["pane_id"], "ISSUE 11 DRAFT AFTER HANDOFF")
+        herdr.set_status(existing["pane_id"], agent_status="working")
+
+        second = self.run_cycle(state["issues"])
+        self.assertEqual(second.returncode, 0, second.stderr)
+        state = json.loads(self.gh_state.read_text())
+        herdr = FakeHerdr(self.herdr_state)
+        herdr.set_status(existing["pane_id"], agent_status="idle")
+        third = self.run_cycle(state["issues"])
+        self.assertEqual(third.returncode, 0, third.stderr)
+
+        herdr = FakeHerdr(self.herdr_state)
+        retained = next(row for row in herdr.list_agents() if row["name"] == "fixture-issue-10")
+        fresh_retained = next(row for row in herdr.list_agents() if row["name"] == "fixture-issue-11")
+        self.assertEqual(retained["tab_id"], existing["tab_id"])
+        self.assertEqual(retained["session_id"], existing["session_id"])
+        self.assertEqual(retained["agent_status"], "idle")
+        self.assertEqual(fresh_retained["tab_id"], fresh["tab_id"])
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD COLLABORATION DRAFT")
+        self.assertEqual(
+            herdr.get_pane(existing["pane_id"])["draft"],
+            "ISSUE 10 COLLABORATION DRAFT",
+        )
+        self.assertEqual(
+            herdr.get_pane(fresh["pane_id"])["draft"],
+            "ISSUE 11 DRAFT AFTER HANDOFF",
+        )
+        starts = [
+            row
             for row in herdr.log
-        ))
+            if row["operation"] == "agent.start"
+            and row["inputs"]["name"] == "fixture-issue-11"
+        ]
+        self.assertEqual(len(starts), 1)
+        self.assert_only_fresh_handoff("fixture-issue-11")
+        self.assertEqual(self.prompts_for("board-test"), [])
+        self.assertEqual(self.prompts_for("fixture-issue-10"), [])
+
+    def test_present_owner_statuses_and_selection_gates_remain_authoritative(self) -> None:
+        statuses = ("working", "blocked", "idle", "done", "failed", "dead", "unknown")
+        config = json.loads(self.config.read_text())
+        config["boards"][0]["concurrency"] = len(statuses) + 1
+        self.config.write_text(json.dumps(config))
+        herdr = FakeHerdr(self.herdr_state)
+        herdr.set_draft(self.board_pane, "BOARD DRAFT: status matrix")
+        owners: dict[int, dict[str, object]] = {}
+        issues: list[dict[str, object]] = []
+        for offset, status in enumerate(statuses):
+            number = 20 + offset
+            owners[number] = self.seed_issue_owner(
+                number,
+                status=status,
+                draft=f"ISSUE {number} DRAFT: {status}",
+            )
+            issues.append({
+                "number": number,
+                "title": f"{status} owner",
+                "body": "",
+                "labels": ["mgr:in-flight"],
+                "state": "OPEN",
+            })
+        issues.extend([
+            {"number": 90, "title": "held approval", "body": "", "labels": ["mgr:hold", "mgr:manual-approve"], "state": "OPEN"},
+            {"number": 91, "title": "research", "body": "", "labels": ["research"], "state": "OPEN"},
+            {"number": 92, "title": "dependent", "body": "Blocked by: #91", "labels": [], "state": "OPEN"},
+            {"number": 99, "title": "approved", "body": "", "labels": ["priority:high", "mgr:manual-approve"], "state": "OPEN"},
+        ])
+
+        result = self.run_cycle(issues)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.gh_state.read_text())
+        claimed = {
+            row["number"]
+            for row in state["issues"]
+            if "mgr:in-flight" in row["labels"]
+        }
+        self.assertEqual(claimed, {*owners, 99})
+        herdr = FakeHerdr(self.herdr_state)
+        for number, status in zip(owners, statuses):
+            with self.subTest(status=status):
+                owner = next(
+                    row
+                    for row in herdr.list_agents()
+                    if row["name"] == f"fixture-issue-{number}"
+                )
+                self.assertEqual(owner["tab_id"], owners[number]["tab_id"])
+                self.assertEqual(owner["agent_status"], status)
+                self.assertEqual(
+                    herdr.get_pane(owner["pane_id"])["draft"],
+                    f"ISSUE {number} DRAFT: {status}",
+                )
+                self.assertEqual(self.prompts_for(owner["name"]), [])
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: status matrix")
+        self.assert_only_fresh_handoff("fixture-issue-99")
 
     def test_orphan_cleanup_rejects_incomplete_runtime_identity(self) -> None:
         herdr = FakeHerdr(self.herdr_state)
+        herdr.set_draft(self.board_pane, "BOARD DRAFT: orphan cleanup")
         orphan_path = self.root / "issue-9-orphan"
         herdr.create_workspace(str(orphan_path), workspace_id="ws_orphan", linked_worktree=True)
         raw = json.loads(self.herdr_state.read_text())
@@ -290,12 +573,16 @@ class WatcherIntegrationTests(unittest.TestCase):
         cleaned = self.run_cycle([])
         self.assertEqual(cleaned.returncode, 0, cleaned.stderr)
         self.assertNotIn("ws_orphan", json.loads(self.herdr_state.read_text())["workspaces"])
+        herdr = FakeHerdr(self.herdr_state)
+        self.assertEqual(self.input_mutations(), [])
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: orphan cleanup")
 
     def test_capacity_count_exceeds_cli_default_page_without_overlaunch(self) -> None:
         config = json.loads(self.config.read_text())
         config["boards"][0]["concurrency"] = 31
         self.config.write_text(json.dumps(config))
         herdr = FakeHerdr(self.herdr_state)
+        herdr.set_draft(self.board_pane, "BOARD DRAFT: capacity")
         issues = []
         for number in range(1, 32):
             issues.append({
@@ -308,7 +595,8 @@ class WatcherIntegrationTests(unittest.TestCase):
             created = herdr.create_tab("ws_main", str(self.repo), label=f"fixture/issue-{number}: active")
             pane = created["root_pane"]["pane_id"]
             herdr.start_agent(f"fixture-issue-{number}", pane)
-            herdr.prompt_agent(f"fixture-issue-{number}", "continue")
+            herdr.set_status(pane, agent_status="working")
+            herdr.set_draft(pane, f"ISSUE {number} DRAFT")
         issues.append({"number": 99, "title": "must wait", "body": "", "labels": [], "state": "OPEN"})
 
         result = self.run_cycle(issues)
@@ -320,6 +608,16 @@ class WatcherIntegrationTests(unittest.TestCase):
             row["operation"] == "agent.start" and row["inputs"]["name"] == "fixture-issue-99"
             for row in FakeHerdr(self.herdr_state).log
         ))
+        herdr = FakeHerdr(self.herdr_state)
+        self.assertEqual(self.input_mutations(), [])
+        self.assertEqual(herdr.get_pane(self.board_pane)["draft"], "BOARD DRAFT: capacity")
+        for number in range(1, 32):
+            owner = next(
+                row
+                for row in herdr.list_agents()
+                if row["name"] == f"fixture-issue-{number}"
+            )
+            self.assertEqual(herdr.get_pane(owner["pane_id"])["draft"], f"ISSUE {number} DRAFT")
         self.assertIn("in-flight=31 free=0", result.stdout)
 
 

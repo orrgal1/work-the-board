@@ -14,6 +14,12 @@ issues, claims capacity, and launches one visible coordinator session per issue 
 repository's primary Herdr workspace. Each coordinator creates a plain Git worktree;
 there is no per-issue Herdr workspace, helper process, or second coordinator.
 
+Each newly created coordinator receives exactly one initial handoff, including a fresh
+coordinator created for absent-owner recovery. The watcher never injects later prompts,
+send-keys, or composer input into an existing owner or the board; that coordinator keeps
+completion responsibility. Explicit communication requested by a human operator is not
+routine watcher automation.
+
 Tiered planning and review are internal task children. Provider-local mappings must be
 loaded before dispatch and runtime metadata must prove the selected role/provider/model.
 A routing failure is reported; it is never bypassed with a headless/background OMP
@@ -29,8 +35,12 @@ Install or symlink each skill directory into the harness skill directory, instal
 agent role files from `agents/`, and ensure Bash, `jq`, `git`, `gh`, and `herdr` are on
 `PATH`. Configure provider-local plan/review role mappings in one OMP config and give its
 absolute path to the watcher so every issue coordinator loads it at initial launch.
-Start the watcher through the harness process manager as documented in
-`work-the-board/SKILL.md`; do not hand-roll a polling loop.
+The single-board interface is `watch.sh <workspace> <concurrency> [poll_seconds]
+--mode supervised|auto [--project owner/number]`; pass `--mode` explicitly. Old
+four/five-positional report-target forms and any multi-board `report_agent` field,
+including null or empty values, fail closed before external calls. Start the watcher
+through the harness process manager as documented in `work-the-board/SKILL.md`; do not
+hand-roll a polling loop. Observe it passively through process status and watcher logs.
 
 ## Updating a running board
 

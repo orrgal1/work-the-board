@@ -10,7 +10,12 @@ PR before implementation, and never edit the primary checkout.
 
 ## 1. Select and claim
 
-When the watcher hands over an already-claimed issue, verify `mgr:in-flight` (repo mode)
+The watcher gives a newly created coordinator exactly one initial handoff. Absent-owner
+recovery creates a fresh coordinator and gives it the same one-time handoff; the watcher
+never injects later prompts, send-keys, or composer input into an existing owner or the
+board. This coordinator retains end-to-end completion responsibility.
+
+When that handoff supplies an already-claimed issue, verify `mgr:in-flight` (repo mode)
 or `In progress` (project mode) and continue. Standalone selection uses open issues with
 none of `mgr:in-flight`, `mgr:hold`, or `research`, whose `Blocked by:` dependencies are
 closed; choose `priority:high` first, then lowest number, and claim immediately. In
@@ -68,6 +73,10 @@ tier (tier 2 when no plan ran), with tier 3 from round 3 onward.
 
 Rewrite the PR body with what changed and why, root cause for bugs, concrete verification,
 unfixed observations, and `Closes #<N>`.
+
+An explicit human instruction to hold, pause, wait, resume, or approve or decline landing
+is authoritative. Human-requested coordinator communication is not routine watcher
+automation.
 
 - With `mgr:manual-approve`: compare the primary against its baseline, mark ready, keep
   the worktree and claim, report that approval is required, and stop.

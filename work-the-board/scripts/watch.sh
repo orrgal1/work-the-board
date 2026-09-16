@@ -3,7 +3,7 @@
 # in flight by selecting, claiming, and handing out ready issues to
 # next-issue sessions.
 #
-# Usage: watch.sh <workspace_id> <concurrency> [poll_seconds] [report_agent] [supervised|auto] [--project <owner>/<number>]
+# Usage: watch.sh <workspace_id> <concurrency> [poll_seconds] --mode supervised|auto [--project <owner>/<number>]
 #        watch.sh --config <file>
 #
 #   mode: supervised (default) — sessions stop after pushing; the operator
@@ -23,15 +23,15 @@
 #         In progress = in flight (the only status counting against
 #         concurrency), Blocked = hold (no pickup, no slot), Done =
 #         finished. The watcher is the only Status writer; a human dragging
-#         a card is authoritative - the watcher observes and reports the
-#         move, never fights it. research and mgr:manual-approve stay issue
-#         properties and apply identically in both modes.
+#         a card is authoritative - the watcher observes the move and never
+#         fights it. research and mgr:manual-approve stay issue properties
+#         and apply identically in both modes.
 #
 #   --config <file>: one watcher, several boards. The JSON file lists repo
 #         (label-based) boards, Projects v2 boards, or a mix, each with its
 #         own checkout path, workspace, concurrency, and mode:
 #
-#           { "poll_seconds": 30, "report_agent": "board",
+#           { "poll_seconds": 30,
 #             "boards": [
 #               { "name": "harness", "kind": "repo", "repo": "owner/repo",
 #                 "path": "/abs/checkout", "workspace": "ws_abc",
@@ -63,7 +63,7 @@
 #      mgr:in-flight, opens a tab, starts an omp agent, and hands it that
 #      specific issue number. Nothing ready means nothing launched.
 #      Existing in-flight claims are reconciled from the same validated
-#      Herdr snapshot; ambiguous ownership retains the claim and reports it.
+#      Herdr snapshot; ambiguous ownership retains the claim and logs it.
 #   4. Sweeps tabs whose issue is closed and whose worktree is gone.
 # Then sleeps once, and repeats.
 #
@@ -73,20 +73,21 @@
 # A claim is released again if the session fails to come up.
 set -uo pipefail
 
-USAGE="usage: watch.sh <workspace_id> <concurrency> [poll_seconds] [report_agent] [supervised|auto] [--project <owner>/<number>]
+USAGE="usage: watch.sh <workspace_id> <concurrency> [poll_seconds] --mode supervised|auto [--project <owner>/<number>]
        watch.sh --config <file>"
 
-# Positionals stay positional; --project is a trailing flag, so every
-# existing invocation parses exactly as before. --config excludes both.
+# The positional form accepts exactly workspace, concurrency, and optional
+# poll seconds. Mode and project selection are explicit flags so removed
+# report-recipient positionals cannot be silently reinterpreted.
 POS_KIND=repo
 PROJECT_OWNER=""
 PROJECT_NUMBER=""
 WORKSPACE=""
 CONCURRENCY=""
 POLL_SECONDS=30
-REPORT_TARGET=""
 MODE=supervised
 CONFIG_FILE=""
+MODE_SET=0
 AGENT_CONFIG=${WORK_THE_BOARD_AGENT_CONFIG:-}
 
 npos=0
@@ -99,6 +100,15 @@ while [ $# -gt 0 ]; do
         echo "$USAGE" >&2
         exit 2
       fi
+      shift 2
+      ;;
+    --mode)
+      MODE="${2:-}"
+      case "$MODE" in
+        supervised|auto) ;;
+        *) echo "bad --mode value: '$MODE' (want supervised or auto)" >&2; echo "$USAGE" >&2; exit 2 ;;
+      esac
+      MODE_SET=1
       shift 2
       ;;
     --project)
@@ -120,14 +130,17 @@ while [ $# -gt 0 ]; do
       POS_KIND=project
       shift 2
       ;;
+    --*)
+      echo "unknown option: $1" >&2
+      echo "$USAGE" >&2
+      exit 2
+      ;;
     *)
       npos=$((npos + 1))
       case "$npos" in
         1) WORKSPACE="$1" ;;
         2) CONCURRENCY="$1" ;;
         3) POLL_SECONDS="$1" ;;
-        4) REPORT_TARGET="$1" ;;
-        5) MODE="$1" ;;
         *) echo "$USAGE" >&2; exit 2 ;;
       esac
       shift
@@ -203,10 +216,9 @@ repo_ws_field() {        # <i> <nwo>
   printf 'repos[%s].workspace\n' "${k:-?}"
 }
 
-# skip_once <nwo>: rc 0 exactly once per (board, repo) — records
-# "<board>\x01<nwo>" in the current board's SKIP set and refuses the second
-# time. The unmapped-repo notice goes through this so it fires on state
-# entry only, like the other latched reports.
+# skip_once <key>: rc 0 exactly once per (board, key) — records
+# "<board>\x01<key>" in the current board's SKIP set and refuses the second
+# time. Latched diagnostics go through this so they log only on state entry.
 skip_once() {
   local sep set
   sep=$'\x01'
@@ -230,8 +242,7 @@ ws_dead_clear() { local s; bv "$1" WSDEAD; s=$bvv; bset "$1" WSDEAD "$(grep -vxF
 # BOARD_<i>_AGENTBUSY. Unlike SKIP this is clearable (like ws_dead*): once
 # a later cycle's name check no longer finds that agent live, the launch
 # loop clears the mark so a genuinely new occurrence of the same issue
-# number still gets its own report instead of being silently swallowed by
-# a stale latch (#20).
+# number is not silently swallowed by a stale latch (#20).
 agent_busy()       { local s; bv "$1" AGENTBUSY; s=$bvv; [ -n "$2" ] && grep -qxF "$2" <<<"$s"; }
 agent_busy_mark()  { local s; bv "$1" AGENTBUSY; s=$bvv; agent_busy "$1" "$2" || bset "$1" AGENTBUSY "$(printf '%s\n%s' "$s" "$2")"; }
 agent_busy_clear() { local s; bv "$1" AGENTBUSY; s=$bvv; bset "$1" AGENTBUSY "$(grep -vxF "$2" <<<"$s")"; }
@@ -291,10 +302,8 @@ def berrs($i):
    else
      (if ($cfg.poll_seconds != null) and (($cfg.poll_seconds | posint) | not)
       then [["ERR", "-", "poll_seconds", "must be a positive integer"]] else [] end)
-     + (if ($cfg.report_agent != null)
-           and ((($cfg.report_agent | istr)
-                 and (($cfg.report_agent == "") or ($cfg.report_agent | clean))) | not)
-        then [["ERR", "-", "report_agent", "must be a string without control characters or backslashes"]] else [] end)
+     + (if ($cfg | has("report_agent"))
+        then [["ERR", "-", "report_agent", "is no longer supported"]] else [] end)
      + (if ($cfg.agent_config != null)
            and ((($cfg.agent_config | clean) and ($cfg.agent_config | startswith("/"))) | not)
         then [["ERR", "-", "agent_config", "must be an absolute readable configuration path"]] else [] end)
@@ -331,8 +340,8 @@ def berrs($i):
 '
 
 if [ -n "$CONFIG_FILE" ]; then
-  if [ "$npos" -gt 0 ] || [ "$POS_KIND" = "project" ]; then
-    echo "watch.sh: --config cannot be combined with positional arguments or --project" >&2
+  if [ "$npos" -gt 0 ] || [ "$POS_KIND" = "project" ] || [ "$MODE_SET" -eq 1 ]; then
+    echo "watch.sh: --config cannot be combined with positional arguments, --mode, or --project" >&2
     echo "$USAGE" >&2
     exit 2
   fi
@@ -353,6 +362,10 @@ else
     echo "$USAGE" >&2
     exit 2
   fi
+  if [ "$MODE_SET" -ne 1 ]; then
+    echo "$USAGE" >&2
+    exit 2
+  fi
   case "$MODE" in
     supervised|auto) ;;
     *) echo "unknown mode: $MODE" >&2; echo "$USAGE" >&2; exit 2 ;;
@@ -367,7 +380,7 @@ else
   fi
   CONFIG_JSON=$(jq -n \
     --arg ws "$WORKSPACE" --arg conc "$CONCURRENCY" --arg poll "$POLL_SECONDS" \
-    --arg report "$REPORT_TARGET" --arg mode "$MODE" --arg kind "$POS_KIND" \
+    --arg mode "$MODE" --arg kind "$POS_KIND" \
     --arg repo "$POS_NWO" --arg path "$PWD" --arg agent_config "$AGENT_CONFIG" \
     --arg owner "$PROJECT_OWNER" --arg number "$PROJECT_NUMBER" '
     { poll_seconds: ($poll | tonumber? // $poll),
@@ -379,7 +392,6 @@ else
              else { owner: $owner, number: ($number | tonumber? // $number),
                     repos: [ { repo: $repo, path: $path, workspace: $ws } ] }
              end) ) ] }
-    + (if $report == "" then {} else { report_agent: $report } end)
     + (if $agent_config == "" then {} else { agent_config: $agent_config } end)')
 fi
 
@@ -401,7 +413,6 @@ if grep -q '^ERR' <<<"$rows"; then
 fi
 
 IFS=$'\t' read -r _tag POLL_SECONDS <<<"$(grep '^CFG' <<<"$rows")"
-REPORT_TARGET=$(jq -r '.report_agent // ""' <<<"$CONFIG_JSON")
 AGENT_CONFIG=$(jq -r '.agent_config // ""' <<<"$CONFIG_JSON")
 if [ -n "$AGENT_CONFIG" ] && [ ! -r "$AGENT_CONFIG" ]; then
   echo "watch.sh: config: agent_config: cannot read $AGENT_CONFIG" >&2
@@ -607,15 +618,13 @@ while IFS=$'\t' read -r _tag c_name c_kind c_repo c_path c_ws c_conc c_mode c_ow
   # Mutable per-board state, saved/restored around each service_board call.
   bset "$i" PREV_INFLIGHT ""
   bset "$i" FIRST 1
-  bset "$i" FLIGHT_CACHE ""
-  bset "$i" FLIGHT_SEEN_DEPART ""
   bset "$i" DONE_SYNCED ""
   bset "$i" FAILS 0
   bset "$i" BACKOFF 0
-  # Latched skip-once set for unmapped-repo notices: "<board>\x01<nwo>"
-  # lines, appended when the skip is first reported (skip_once). Never
-  # cleared — the config cannot change without a restart, and a restart
-  # re-firing the notice once is acceptable.
+  # Latched skip-once set for passive diagnostics:
+  # "<board>\x01<key>" lines, appended when first logged. Never cleared —
+  # the config cannot change without a restart, and a restart re-logging
+  # the diagnostic once is acceptable.
   bset "$i" SKIP ""
   # Repos whose workspace died and could not be re-established (see ws_dead*):
   # gates claiming, cleared by the launch loop's own recovery retry.
@@ -624,14 +633,10 @@ while IFS=$'\t' read -r _tag c_name c_kind c_repo c_path c_ws c_conc c_mode c_ow
   # (see agent_busy* above): gates claiming, cleared once that agent is
   # no longer live.
   bset "$i" AGENTBUSY ""
-  # Cursor for the slow flight-age scan: epoch seconds before which the
-  # scan does not run for this board. Seeded below with a per-board offset
-  # so N boards' scans do not align into one API spike.
-  bset "$i" AGE_NEXT 0
   # The board's full repo map, "nwo<TAB>path<TAB>workspace" lines: every
   # item is dispatched into ITS OWN repo's checkout and workspace through
   # repo_path/repo_workspace. An item whose repo is not in the map is
-  # skipped (and reported once), never held and never Status-edited.
+  # skipped (and logged once), never held and never Status-edited.
   bset "$i" REPOMAP "$(jq -r --argjson i "$i" \
     '.boards[$i] | (if .kind == "repo"
        then [{repo: .repo, path: .path, workspace: .workspace}]
@@ -697,31 +702,6 @@ while [ "$b" -lt "$NBOARDS" ]; do
   b=$((b + 1))
 done
 
-# Stagger the boards' slow flight-age scans (each board scans only every
-# AGE_SCAN_SECONDS — the notices are hourly, so scanning every poll bought
-# nothing) across the window, so N boards do not fire their first-sight
-# GitHub reads and marker writes in the same cycle.
-AGE_SCAN_SECONDS=600
-NOW_EPOCH=$(date -u +%s)
-b=0
-while [ "$b" -lt "$NBOARDS" ]; do
-  bset "$b" AGE_NEXT $((NOW_EPOCH + b * AGE_SCAN_SECONDS / NBOARDS))
-  b=$((b + 1))
-done
-
-# One per-board summary block, shared by the startup and stop reports: ONE
-# consolidated message listing every board, not one message per board.
-BOARDS_SUMMARY=""
-b=0
-while [ "$b" -lt "$NBOARDS" ]; do
-  bv "$b" NAME; s_name=$bvv
-  bv "$b" KIND; s_kind=$bvv
-  bv "$b" MODE; s_mode=$bvv
-  bv "$b" CONC; s_conc=$bvv
-  BOARDS_SUMMARY=$(printf '%s\n[%s] kind=%s mode=%s concurrency=%s' \
-    "$BOARDS_SUMMARY" "$s_name" "$s_kind" "$s_mode" "$s_conc")
-  b=$((b + 1))
-done
 
 log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
@@ -729,27 +709,13 @@ log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 # file, created once, read only on the failure path.
 ERRFILE=$(mktemp "${TMPDIR:-/tmp}/work-the-board-err.XXXXXX") || exit 1
 # Mutation stderr is never emitted raw: GitHub CLI errors can contain URLs,
-# headers, or other credentials. Only a bounded classification is reported.
+# headers, or other credentials. Only a bounded classification is logged.
 MUTATION_ERRFILE=$(mktemp "${TMPDIR:-/tmp}/work-the-board-mutation-err.XXXXXX") || exit 1
 trap 'rm -f "$ERRFILE" "$MUTATION_ERRFILE"' EXIT
 BOARD_MUTATION_RC=0
 BOARD_MUTATION_CLASS=""
 
-# Reports a material change to the board session so the operator sees it without
-# reading the log. Only state changes are reported — launches, failures, released
-# claims — never idle cycles, or the board session gets woken every poll for
-# nothing. Fire-and-forget: never --wait here, or a busy board session would
-# stall the whole loop. report prefixes the current board's name so N boards'
-# messages stay attributable in one operator session; report_raw carries the
-# watcher-wide consolidated messages (startup/stop) only.
-report_raw() {
-  [ -n "$REPORT_TARGET" ] || return 0
-  herdr agent prompt "$REPORT_TARGET" "board watcher: $1" >/dev/null 2>&1 || true
-}
-report() { report_raw "[$CUR_NAME] $1"; }
-
-
-trap 'log "watcher stopping"; report_raw "stopped.$BOARDS_SUMMARY"; exit 0' TERM INT
+trap 'log "watcher stopping"; exit 0' TERM INT
 
 # ---------------------------------------------------------------------------
 # Board backends. The cycle body only calls board_load / board_inflight /
@@ -873,7 +839,7 @@ repo_board_claim_state() { # <nwo> <num>
 repo_board_finish() { # <nwo> <num>
   if gh issue view "$2" -R "$1" --json labels --jq '[.labels[].name] | index("mgr:in-flight") // empty' 2>/dev/null | grep -q .; then
     board_release "$1" "$2" \
-      && log "issue #$2: stripped stale mgr:in-flight from a closed issue"
+      && log "board $CUR_NAME: issue #$2: stripped stale mgr:in-flight from a closed issue"
   fi
 }
 
@@ -889,7 +855,7 @@ repo_board_finish() { # <nwo> <num>
 # state, which is why board_load also fetches each mapped repo's open issue
 # numbers ($openmap: nwo -> [numbers]). Draft items, PRs, and items of
 # repos outside the board's map ($repos, the mapped nwo list) are dropped
-# here; the unmapped ones are additionally reported — once per (board,
+# here; the unmapped ones are additionally logged — once per (board,
 # repo) — by project_board_load.
 PROJECT_NORMALIZE='
 [ .items[]?
@@ -934,15 +900,14 @@ project_board_load() {
 
   # Items of repos OUTSIDE the map are SKIPPED, not held: their cards stay
   # in Todo untouched — a Status write is a semantic statement about the
-  # work, and "the watcher is misconfigured" is not one — and the operator
-  # is told exactly once per (board, repo). Silently dropping them is this
-  # project's recurring silent-park bug; repeating the notice every poll is
-  # noise. A watcher restart re-firing it once is acceptable.
+  # work, and "the watcher is misconfigured" is not one — and the condition
+  # is logged exactly once per (board, repo). Silently dropping them is this
+  # project's recurring silent-park bug; repeating the diagnostic every poll
+  # is noise. A watcher restart re-logging it once is acceptable.
   while read -r r; do
     [ -z "$r" ] && continue
     skip_once "$r" || continue
     log "board $CUR_NAME: skipping project items of unmapped repo $r (not in this board's repos config)"
-    report "skipping this project's items in $r: that repo is not in this board's repo map. Cards left in Todo untouched; add the repo to the config and restart to dispatch them."
   done <<<"$(jq -r --argjson repos "$mapped_json" \
       '[.items[]? | select((.content.type // "") == "Issue") | .content.repository // ""]
        | unique | .[] | . as $r | select($r != "" and (($repos | index($r)) == null))' <<<"$raw" 2>/dev/null)"
@@ -1012,7 +977,7 @@ project_board_finish() { # <nwo> <num>
   [ -n "$item" ] || return 0
   if project_set_status "$item" "$CUR_OPT_DONE"; then
     PROJECT_DONE_SYNCED=$(printf '%s\n%s' "$PROJECT_DONE_SYNCED" "$nwo#$num")
-    log "issue #$num: closed issue's card moved to Done"
+    log "board $CUR_NAME: issue #$num: closed issue's card moved to Done"
   fi
 }
 
@@ -1050,123 +1015,11 @@ board_release() {
   fi
   local rc=$?
   if [ "$rc" -ne 0 ]; then
-    log "issue #$2: $CLAIM_NOUN release failed: $(board_mutation_diag); board state may remain claimed"
-    report "issue #$2: could not release $CLAIM_NOUN: $(board_mutation_diag). State may remain claimed; inspect before retrying."
+    log "board $CUR_NAME: issue #$2: $CLAIM_NOUN release failed: $(board_mutation_diag); board state may remain claimed"
   fi
   return "$rc"
 }
 board_finish() { if [ "$CUR_KIND" = "project" ]; then project_board_finish "$1" "$2"; else repo_board_finish "$1" "$2"; fi; }
-
-# Converts an ISO-8601 UTC timestamp ("2026-09-10T12:00:00Z") to epoch
-# seconds. BSD date (macOS) and GNU date (Linux) take incompatible flags for
-# this: try BSD's first, then GNU's.
-iso_to_epoch() {
-  date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null \
-    || date -u -d "$1" +%s 2>/dev/null
-}
-
-# First time we see an issue in flight with no recorded start, ask GitHub
-# when mgr:in-flight was actually applied rather than assuming "now" — the
-# issue may have been claimed before this watcher started, or by a prior
-# run (or since a marker comment's own recorded start, by a prior flight
-# period). Falls back to now if the timeline has no such event or the call
-# fails. Returns an ISO-8601 UTC timestamp, GitHub's own format.
-fetch_start_iso() { # <nwo> <num>
-  local nwo="$1" num="$2" ts
-  # The timeline is oldest-first and defaults to 30 events per page (100
-  # max). Without --paginate, a timeline longer than one page hides the
-  # CURRENT flight period's labeling behind older history on page one, so
-  # `| last` picks the last match on page one - the oldest page - not the
-  # most recent labeling. `--paginate` walks every page, but `--jq` runs
-  # once per page rather than once over the concatenated result, so this
-  # prints one line per matching event across all pages; sort them and take
-  # the max instead of trusting document order. per_page=100 in the query
-  # string (NOT `-f`/`-F`, which silently turns a GET into a POST and 404s)
-  # cuts the page count for long timelines rather than paging at the
-  # default 30/page.
-  #
-  # A failed or partial call can put an HTTP error's JSON body on stdout
-  # instead of a timestamp (gh does not route it to stderr), and `{`/`}`
-  # byte-sort ahead of every digit, so an unvalidated result would look
-  # newer than any real timestamp to the caller and poison the marker
-  # comment. Require the exact GitHub timestamp shape before trusting it.
-  ts=$(gh api --paginate "repos/$nwo/issues/$num/timeline?per_page=100" \
-        --jq '.[] | select(.event=="labeled" and .label.name=="mgr:in-flight") | .created_at' \
-        2>/dev/null | sort | tail -n1)
-  case "$ts" in
-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) printf '%s' "$ts" ;;
-    *) date -u +%FT%TZ ;;
-  esac
-}
-
-# State for the long-running-issue notices lives on the issue itself, as a
-# single hidden-marker comment, so it survives a watcher restart, a wiped
-# /tmp, or a machine change, and a human can read it: GitHub is the source
-# of truth, not a local file.
-FLIGHT_MARKER='<!-- work-the-board:flight -->'
-
-# Prints "<comment_id><TAB><start_iso><TAB><hours_reported>" for issue $1's
-# marker comment, or nothing if it has none yet. The comment id is parsed
-# out of the comment's HTML URL ("...#issuecomment-<id>") since `gh issue
-# view --json comments` exposes only the GraphQL node id, not the numeric
-# id the REST PATCH endpoint needs.
-age_comment_for() { # <nwo> <num>
-  local nwo="$1" num="$2" data url body cid start hours
-  data=$(gh issue view "$num" -R "$nwo" --json comments --jq \
-    '[.comments[] | select(.body | startswith("'"$FLIGHT_MARKER"'"))] | last
-     | if . == null then empty else "\(.url)\u0001\(.body)" end' \
-    2>/dev/null)
-  [ -z "$data" ] && return 0
-  url="${data%%$'\x01'*}"
-  body="${data#*$'\x01'}"
-  cid="${url##*#issuecomment-}"
-  start=$(awk -F': ' '/^in-flight start:/{print $2; exit}' <<<"$body")
-  hours=$(awk -F': ' '/^hours reported:/{print $2; exit}' <<<"$body")
-  [ -z "$hours" ] && hours=0
-  printf '%s\t%s\t%s\n' "$cid" "$start" "$hours"
-}
-
-# Renders the marker comment body: the marker line plus two human-readable
-# lines an operator can read directly on the issue.
-flight_comment_body() {
-  printf '%s\nin-flight start: %s\nhours reported: %s\n' "$FLIGHT_MARKER" "$1" "$2"
-}
-
-# Creates the marker comment and prints the new comment's numeric id.
-create_flight_comment() { # <nwo> <num> <body>
-  local nwo="$1" num="$2" body="$3" url
-  url=$(gh issue comment "$num" -R "$nwo" --body "$body" 2>/dev/null)
-  printf '%s' "${url##*#issuecomment-}"
-}
-
-# Rewrites the marker comment in place. Called only on an hour boundary or a
-# clock reset, never every cycle, and never posts a second comment.
-update_flight_comment() { # <nwo> <comment id> <body>
-  gh api --method PATCH "repos/$1/issues/comments/$2" -f "body=$3" >/dev/null 2>&1
-}
-
-# GitHub is the durable record for flight-age state, but it is only READ the
-# first time this process sees an issue in flight and only WRITTEN when an
-# hour boundary fires; every other scan is served from this in-memory
-# mirror. One
-# "<nwo>#<num>\t<start_iso>\t<start_epoch>\t<hours_reported>\t<comment_id>"
-# row per in-flight issue — keyed by the repo-qualified "<nwo>#<num>", since
-# a cross-repo board's repos can reuse issue numbers — in a plain
-# newline-delimited string: this script runs on bash 3.2, which has no
-# associative arrays. FLIGHT_SEEN_DEPART lists the keys that left flight
-# while this process watched, so a re-entry is distinguishable from first
-# sight after a restart. Both are persisted per board
-# (BOARD_<i>_FLIGHT_CACHE / _FLIGHT_SEEN_DEPART) around each service_board
-# call.
-FLIGHT_CACHE=""
-FLIGHT_SEEN_DEPART=""
-
-flight_cache_row() { awk -F'\t' -v n="$1" '$1 == n { print; exit }' <<<"$FLIGHT_CACHE"; }
-flight_cache_drop() { FLIGHT_CACHE=$(awk -F'\t' -v n="$1" 'NF && $1 != n' <<<"$FLIGHT_CACHE"); }
-flight_cache_put() { # <key> <start_iso> <start_epoch> <hours> <comment_id>
-  flight_cache_drop "$1"
-  FLIGHT_CACHE=$(printf '%s\n%s\t%s\t%s\t%s\t%s' "$FLIGHT_CACHE" "$1" "$2" "$3" "$4" "$5")
-}
 
 # Looks up an in-flight issue's title from this cycle's $inflight_data.
 title_for() { # <nwo> <num>
@@ -1273,8 +1126,7 @@ sweep_finished_tabs() {
     [ "$any_closed" -eq 1 ] || continue
 
     if herdr tab close "$tab" >/dev/null 2>&1; then
-      log "issue #$num: closed finished tab $tab"
-      report "closed issue #$num's finished tab ($tab): landed, worktree gone, session done."
+      log "board $CUR_NAME: issue #$num: closed finished tab $tab"
     fi
   done <<<"$tabs"
 }
@@ -1469,8 +1321,8 @@ agent_tab_owns_issue() { # <num> <tab_ids> <tab_label_map>
 # unregisters the stray workspace; the checkout stays on disk, untouched,
 # forever (when it still exists) — this sweep must never delete a git
 # checkout again. A close failure, or any of the skip reasons above, is
-# reported exactly once via skip_once's latch, not every cycle, and
-# retried plainly on later cycles.
+# logged exactly once via skip_once's latch, not every cycle, and retried
+# plainly on later cycles.
 sweep_orphan_worktrees() {
   local ws_out map r p _ws root candidates ws_id ws_checkout ws_root
   local nwo base num key close_out close_rc checkout_canon checkout_missing
@@ -1511,8 +1363,7 @@ $root	$r"
          and (.foreground_cwd == null or (.foreground_cwd | type == "string")))' \
        >/dev/null 2>&1 <<<"$agent_out"; then
     if skip_once "orphan-agent-list-failed"; then
-      log "orphan sweep: herdr agent list failed or returned incomplete identity data — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
-      report "orphan sweep: herdr agent list failed or returned incomplete identity data — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
+      log "board $CUR_NAME: orphan sweep: herdr agent list failed or returned incomplete identity data — cannot confirm no live agent owns any candidate checkout, skipping this cycle"
     fi
     return 0
   fi
@@ -1524,8 +1375,7 @@ $root	$r"
   # data cannot authorize destructive cleanup.
   if ! tab_out=$(herdr tab list 2>/dev/null); then
     if skip_once "orphan-tab-list-failed"; then
-      log "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
-      report "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
+      log "board $CUR_NAME: orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
     fi
     return 0
   fi
@@ -1537,8 +1387,7 @@ $root	$r"
          and (.label == null or (.label | type == "string")))' \
        >/dev/null 2>&1 <<<"$tab_out"; then
     if skip_once "orphan-tab-list-failed"; then
-      log "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
-      report "orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
+      log "board $CUR_NAME: orphan sweep: herdr tab list failed or returned incomplete identity data — skipping this cycle"
     fi
     return 0
   fi
@@ -1597,7 +1446,7 @@ $root	$r"
     fi
     if [ -n "$live_reason" ]; then
       if skip_once "orphan-live-agent:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): live agent found ($live_reason) — left untouched, not closed"
+        log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): live agent found ($live_reason) — left untouched, not closed"
       fi
       continue
     fi
@@ -1617,7 +1466,7 @@ $root	$r"
            and ((.workspace_id | type) == "string" and (.workspace_id | length) > 0))' \
          >/dev/null 2>&1 <<<"$pane_out"; then
       if skip_once "orphan-pane-list-failed:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): herdr pane list failed or returned incomplete identity data — left untouched, cannot confirm no live agent"
+        log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): herdr pane list failed or returned incomplete identity data — left untouched, cannot confirm no live agent"
       fi
       continue
     fi
@@ -1625,14 +1474,14 @@ $root	$r"
     case "$has_agent" in
       ''|*[!0-9]*)
         if skip_once "orphan-pane-count-invalid:$ws_id"; then
-          log "orphan workspace $ws_id (issue #$num, $nwo): could not determine live-pane count (got '$has_agent') — left untouched"
+          log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): could not determine live-pane count (got '$has_agent') — left untouched"
         fi
         continue
         ;;
     esac
     if [ "$has_agent" -gt 0 ]; then
       if skip_once "orphan-live-agent-pane:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): live agent found (pane inside the candidate workspace itself) — left untouched, not closed"
+        log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): live agent found (pane inside the candidate workspace itself) — left untouched, not closed"
       fi
       continue
     fi
@@ -1657,8 +1506,7 @@ $root	$r"
       fi
       if [ "$has_upstream" -ne 1 ] || [ -z "$ahead" ] || [ "$ahead" != "0" ]; then
         if skip_once "orphan-unpushed:$ws_id"; then
-          log "orphan workspace $ws_id (issue #$num, $nwo): no upstream tracking branch, or unpushed commits ahead of upstream (or the check itself failed) — left untouched, not closed"
-          report "found orphan workspace $ws_id for issue #$num ($nwo) but its checkout has no upstream or has commits not yet pushed (left untouched, not closed)"
+          log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): no upstream tracking branch, or unpushed commits ahead of upstream (or the check itself failed) — left untouched, not closed"
         fi
         continue
       fi
@@ -1668,17 +1516,14 @@ $root	$r"
     close_rc=$?
     if [ "$close_rc" -ne 0 ]; then
       if skip_once "orphan-close-failed:$ws_id"; then
-        log "orphan workspace $ws_id (issue #$num, $nwo): workspace close failed: $close_out"
-        report "found orphan workspace $ws_id for issue #$num ($nwo) but could not close its workspace registration (left untouched): $close_out"
+        log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): workspace close failed: $close_out"
       fi
       continue
     fi
     if [ "$checkout_missing" -eq 1 ]; then
-      log "orphan workspace $ws_id (issue #$num, $nwo): closed stray per-worktree workspace registration (checkout path no longer exists on disk: $ws_checkout)"
-      report "closed orphan workspace $ws_id: stray per-worktree workspace registration for issue #$num ($nwo), no live agent, issue not in flight, checkout path no longer exists on disk: $ws_checkout."
+      log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): closed stray per-worktree workspace registration (checkout path no longer exists on disk: $ws_checkout)"
     else
-      log "orphan workspace $ws_id (issue #$num, $nwo): closed stray per-worktree workspace registration (git checkout left on disk, untouched: $ws_checkout)"
-      report "closed orphan workspace $ws_id: stray per-worktree workspace registration for issue #$num ($nwo), no live agent, issue not in flight, checkout clean and pushed. Git checkout left on disk, untouched: $ws_checkout."
+      log "board $CUR_NAME: orphan workspace $ws_id (issue #$num, $nwo): closed stray per-worktree workspace registration (git checkout left on disk, untouched: $ws_checkout)"
     fi
   done <<<"$candidates"
 }
@@ -1741,9 +1586,6 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   if [ "$rpw_rc" -eq 0 ]; then
     repo_set_workspace "$CUR_IDX" "$nwo" "$found" "$old"
     log "board $CUR_NAME: config field $field workspace $old no longer exists; adopted live primary workspace $found for $path"
-    if skip_once "ws-recovered:$nwo"; then
-      report "config fault, recovered for this run: $field is workspace $old, which no longer exists - herdr destroys a workspace when its last tab closes. Launches for $nwo now use $found, this repo's own live primary workspace for $path. Set $field to $found in the config: a restart still exits 2 on the stale id."
-    fi
     WS_ENSURE_NEW="$found"; return 0
   elif [ "$rpw_rc" -eq 2 ]; then
     # Could not determine whether $path already has a live primary
@@ -1837,9 +1679,6 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
     # possibly a live session's - so no anchor rename, no ownership claim.
     repo_set_workspace "$CUR_IDX" "$nwo" "$new" "$old"
     log "board $CUR_NAME: config field $field workspace $old no longer exists; adopted live primary workspace $new for $path"
-    if skip_once "ws-recovered:$nwo"; then
-      report "config fault, recovered for this run: $field is workspace $old, which no longer exists - herdr destroys a workspace when its last tab closes. Launches for $nwo now use $new, this repo's own live primary workspace for $path. Set $field to $new in the config: a restart still exits 2 on the stale id."
-    fi
     WS_ENSURE_NEW="$new"; return 0
   fi
   anchor=$(jq -r '.result.tab.tab_id // empty' <<<"$out" 2>/dev/null)
@@ -1854,19 +1693,14 @@ ensure_repo_workspace() {   # <nwo> <path> <old_ws>   (uses CUR_IDX/CUR_NAME)
   [ -n "$anchor" ] && herdr tab rename "$anchor" "$CUR_NAME workspace anchor - do not close" >/dev/null 2>&1
   repo_set_workspace "$CUR_IDX" "$nwo" "$new" "$old"
   log "board $CUR_NAME: config field $field workspace $old no longer exists and $path has no live primary workspace; opened $new (anchor tab ${anchor:-none})"
-  if skip_once "ws-recovered:$nwo"; then
-    report "config fault, recovered for this run: $field is workspace $old, which no longer exists - herdr destroys a workspace when its last tab closes, and nothing was holding this one open. Re-opened $path as workspace $new with an anchor tab named $CUR_NAME workspace anchor - do not close; launches for $nwo use it from now on. Set $field to $new in the config (a restart still exits 2 on the stale id) and leave the anchor tab open."
-  fi
   WS_ENSURE_NEW="$new"; return 0
 }
 
 # Pre-claim gate for a repo previously found unusable: retries the recovery
 # (local herdr calls only - no GitHub call, no claim, nothing to release) so
-# the board picks itself up without a restart. The recovery's own latched
-# report (ensure_repo_workspace's "ws-recovered:<nwo>") already tells the
-# operator about the transition with the field name, old id, and new id -
-# this does not report again, only clears WSDEAD. rc 1 means "do not claim
-# for this repo this cycle".
+# the board picks itself up without a restart. ensure_repo_workspace logs the
+# recovery transition with the field name, old id, and new id; this only
+# clears WSDEAD. rc 1 means "do not claim for this repo this cycle".
 board_repo_launchable() {   # <nwo>
   local path old
   ws_dead "$CUR_IDX" "$1" || return 0
@@ -1885,7 +1719,7 @@ release_claim_if_owned() {
 # issue. Releases the claim and cleans up the tab if anything fails.
 launch_issue() {
   local nwo="$1" num="$2" title="$3"
-  local name create_json pane tab start_out start_out_report attempt prompt err_code ws_retry
+  local name create_json pane tab start_out attempt prompt err_code ws_retry
   local -a start_args
   local pr_info pr_num pr_branch adopt branch_only item_path item_ws orig_ws
 
@@ -1895,7 +1729,7 @@ launch_issue() {
   # board's first repo. The backends only emit mapped repos, so a miss here
   # is a watcher bug, not a config gap: release and surface it.
   if ! item_path=$(repo_path "$CUR_IDX" "$nwo") || ! item_ws=$(repo_workspace "$CUR_IDX" "$nwo"); then
-    log "issue #$num: BUG: repo $nwo is not in board $CUR_NAME's repo map, releasing claim"
+    log "board $CUR_NAME: issue #$num: BUG: repo $nwo is not in the board's repo map, releasing claim"
     release_claim_if_owned "$nwo" "$num"
     return 1
   fi
@@ -1941,23 +1775,12 @@ launch_issue() {
         # already confirmed $orig_ws is gone - the "could not determine"
         # uncertainty is about whether a REPLACEMENT could be resolved this
         # cycle, not about whether the configured workspace still exists.
-        # Still fail closed on claiming (ws_dead_mark + release below), but
-        # the wording must say what is actually known: gone, not "not
-        # confirmed gone" (#19 review round 3, MJ2). The latch key is also
-        # its own now, not shared with the permanent-fault branch below
-        # (#19 review round 3, MJ1): a shared key meant the first transient
-        # blip on a repo silently swallowed every later genuine break
-        # report for it, since skip_once never clears.
-        log "issue #$num: board $CUR_NAME: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; launch outcome is recorded for context-aware claim handling"
-        if skip_once "ws-transient:$nwo"; then
-          report "workspace gone, replacement not yet resolved: herdr confirmed $(repo_ws_field "$CUR_IDX" "$nwo")'s workspace $orig_ws for $item_path no longer exists, but a replacement could not be resolved for $nwo this cycle, likely a transient herdr/git hiccup ($WS_ENSURE_ERR). The claim is handled according to fresh-launch versus recovery ownership; the board retries the local check next cycle. If this repeats, update $(repo_ws_field "$CUR_IDX" "$nwo") to a workspace that is $item_path's own live primary workspace."
-        fi
+        # Still fail closed on claiming (ws_dead_mark + release below) while
+        # logging the confirmed loss separately from replacement uncertainty.
+        log "board $CUR_NAME: issue #$num: workspace $orig_ws for $item_path is confirmed gone (workspace_not_found) and no replacement could be resolved this cycle: $WS_ENSURE_ERR; launch outcome is recorded for context-aware claim handling"
       else
         # Permanent, not transient: no workspace can be had for this repo.
-        log "issue #$num: board $CUR_NAME: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $orig_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim handling follows launch context"
-        if skip_once "ws-broken:$nwo"; then
-          report "config fault, NOT a transient launch failure: $(repo_ws_field "$CUR_IDX" "$nwo") is workspace $orig_ws, which no longer exists, and herdr could not open $item_path as a workspace either ($WS_ENSURE_ERR). Nothing will launch for $nwo on this board until this is fixed: check $item_path still exists and is that repo's own primary checkout, open it as its own herdr workspace, and set that field to the new workspace id. Claim handling follows fresh-launch versus recovery ownership; further issues for $nwo are now skipped WITHOUT claiming, so the board stops churning."
-        fi
+        log "board $CUR_NAME: issue #$num: config field $(repo_ws_field "$CUR_IDX" "$nwo") workspace $orig_ws no longer exists and $item_path could not be opened as a workspace: $WS_ENSURE_ERR; claim handling follows launch context"
       fi
       ws_dead_mark "$CUR_IDX" "$nwo"
       RECOVERY_RESULT=definite
@@ -1966,16 +1789,14 @@ launch_issue() {
     fi
     # Anything else stays a transient launch failure, carrying herdr's own
     # error code so "retry will fix this" is distinguishable at a glance.
-    log "issue #$num: tab create failed${err_code:+ ($err_code)}: $create_json"
-    report "issue #$num could not start: tab create failed${err_code:+ ($err_code)}; recovery retains the existing claim for a later retry."
+    log "board $CUR_NAME: issue #$num: tab create failed${err_code:+ ($err_code)}: $create_json"
     release_claim_if_owned "$nwo" "$num"
     return 1
   done
   pane=$(jq -r '.result.root_pane.pane_id // empty' <<<"$create_json" 2>/dev/null)
   tab=$(jq -r '.result.tab.tab_id // empty' <<<"$create_json" 2>/dev/null)
   if [ -z "$pane" ] || [ -z "$tab" ]; then
-    log "issue #$num: tab create returned no pane/tab id, response was: $create_json"
-    report "issue #$num could not start: tab create returned no pane id; recovery retains the existing claim pending inspection."
+    log "board $CUR_NAME: issue #$num: tab create returned no pane/tab id, response was: $create_json"
     release_claim_if_owned "$nwo" "$num"
     return 1
   fi
@@ -1997,20 +1818,7 @@ launch_issue() {
     esac
   done
   if [ "$attempt" -ge 10 ]; then
-    log "issue #$num: agent start failed on pane $pane, closing tab $tab and releasing claim: $start_out"
-    # Collapsed and bounded for the operator report only (review #20 MN3):
-    # $start_out is herdr's raw, possibly multi-line/arbitrary-length stderr
-    # capture, and an empty capture must not render as a bare trailing
-    # colon. start_out_report collapses it to one line so it slots cleanly
-    # mid sentence, truncates it with a marker so the operator can tell
-    # there is more in the log, and substitutes a placeholder when empty;
-    # the untruncated original is already in the log line above.
-    start_out_report=${start_out//$'\n'/ }
-    if [ "${#start_out_report}" -gt 300 ]; then
-      start_out_report="${start_out_report:0:300}…"
-    fi
-    [ -z "$start_out_report" ] && start_out_report="(herdr reported no error output)"
-    report "issue #$num could not start: agent start failed on pane $pane: $start_out_report. Tab closure was attempted; recovery keeps the existing claim when cleanup is uncertain."
+    log "board $CUR_NAME: issue #$num: agent start failed on pane $pane, closing tab $tab and releasing claim: $start_out"
     if herdr tab close "$tab" >/dev/null 2>&1; then
       case "$start_out" in *agent_pane_busy*) RECOVERY_RESULT=definite ;; esac
     fi
@@ -2056,13 +1864,11 @@ $instructions"
 
   if ! herdr agent prompt "$name" "$prompt" \
         --wait --until working --until blocked --timeout 20000 >/dev/null 2>&1; then
-    log "issue #$num: prompt not confirmed on tab $tab; leaving tab and claim in place for manual inspection"
-    report "issue #$num: agent started on tab $tab but did not confirm the prompt. Tab and claim left in place - needs a look."
+    log "board $CUR_NAME: issue #$num: prompt not confirmed on tab $tab; leaving tab and claim in place for manual inspection"
     return 1
   fi
 
-  log "issue #$num launched: $title (pane $pane tab $tab)"
-  report "launched issue #$num ($title) on tab $tab. $CLAIMED_REPORT; that session owns it from here."
+  log "board $CUR_NAME: issue #$num launched: $title (pane $pane tab $tab)"
   return 0
 }
 # Reconcile claims that outlive their issue session.  The watcher remains the
@@ -2083,30 +1889,23 @@ reconcile_inflight_sessions() {
     if [ "$agent_record" = "present" ] && [ -z "$agent_status" ]; then
       if ! recovery_latched "ambiguous:$CUR_NAME:$key"; then
         RECOVERY_LATCH=$(printf '%s\nambiguous:%s:%s' "$RECOVERY_LATCH" "$CUR_NAME" "$key")
-        report "issue #$num has a reserved agent name without matching repository identity; retaining its claim until ownership is resolved."
+        log "board $CUR_NAME: issue #$num has a reserved agent name without matching repository identity; retaining its claim until ownership is resolved"
       fi
       continue
     fi
     if awk -F'\t' -v n="$num" -v own="$agent_name" '$1 != own && $1 ~ "-issue-" n "$" { found=1 } END { exit(found ? 0 : 1) }' <<<"$live_records"; then
       if ! recovery_latched "ambiguous:$CUR_NAME:$key"; then
         RECOVERY_LATCH=$(printf '%s\nambiguous:%s:%s' "$RECOVERY_LATCH" "$CUR_NAME" "$key")
-        report "issue #$num has an ambiguous reserved agent name; retaining its claim until the global name collision is resolved."
+        log "board $CUR_NAME: issue #$num has an ambiguous reserved agent name; retaining its claim until the global name collision is resolved"
       fi
       continue
     fi
     RECOVERY_LATCH=$(grep -vxF "ambiguous:$CUR_NAME:$key" <<<"$RECOVERY_LATCH")
+    # Every present owner status is authoritative and remains unprompted;
+    # only an absent owner reaches the fresh-coordinator recovery below.
     case "$agent_status" in
-      working|blocked)
+      working|blocked|idle)
         RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
-        RECOVERY_LATCH=$(grep -vxF "idle:$key" <<<"$RECOVERY_LATCH")
-        continue ;;
-      idle)
-        RECOVERY_LATCH=$(grep -vxF "$key" <<<"$RECOVERY_LATCH")
-        if [ "$CUR_MODE" = "auto" ] && ! recovery_latched "idle:$key"; then
-          RECOVERY_LATCH=$(printf '%s\nidle:%s' "$RECOVERY_LATCH" "$key")
-          report "issue #$num's owner $agent_name is idle; requested continuation through reachable completion work."
-          herdr agent prompt "$agent_name" "Continue the current issue handoff through all reachable implementation, publication, verification, review, and authorized landing; preserve any explicit hold or external question." >/dev/null 2>&1 || RECOVERY_LATCH=$(grep -vxF "idle:$key" <<<"$RECOVERY_LATCH")
-        fi
         continue ;;
       done|failed|unknown)
         continue ;;
@@ -2118,7 +1917,7 @@ reconcile_inflight_sessions() {
     recovery_latched "$key" && continue
     RECOVERY_LATCH=$(printf '%s\n%s' "$RECOVERY_LATCH" "$key")
     title=$(title_for "$nwo" "$num")
-    report "issue #$num has an in-flight claim but no live owner; adopting preserved work."
+    log "board $CUR_NAME: issue #$num has an in-flight claim but no live owner; starting a fresh coordinator to adopt preserved work"
     RECOVERY_MODE=1
     RECOVERY_RESULT=uncertain
     if launch_issue "$nwo" "$num" "$title"; then
@@ -2140,8 +1939,8 @@ reconcile_inflight_sessions() {
 # ---------------------------------------------------------------------------
 
 # Loads board <i>'s config into the CUR_* working set the backends and
-# launch path read, and picks the mode-dependent wording for handout prompts
-# and reports; the repo-mode strings are the original text, byte for byte.
+# launch path read, and picks the mode-dependent wording for the fresh
+# handoff prompt and claim diagnostics.
 board_ctx_load() {
   local i="$1"
   CUR_IDX=$i
@@ -2163,12 +1962,10 @@ board_ctx_load() {
   if [ "$CUR_KIND" = "project" ]; then
     CLAIM_PHRASE="on the project board (its card's Status is In progress; Status is watcher-owned - never edit it)"
     UNCLAIM_PHRASE="close the issue - the board watcher moves the project card to Done itself"
-    CLAIMED_REPORT="Moved its card to In progress"
     CLAIM_NOUN="the board slot"
   else
     CLAIM_PHRASE="with mgr:in-flight"
     UNCLAIM_PHRASE="close the issue and remove mgr:in-flight"
-    CLAIMED_REPORT="Claimed mgr:in-flight"
     CLAIM_NOUN="mgr:in-flight"
   fi
 }
@@ -2177,8 +1974,6 @@ board_state_load() {
   local i="$1"
   bv "$i" PREV_INFLIGHT; prev_inflight=$bvv
   bv "$i" FIRST; first_cycle=$bvv
-  bv "$i" FLIGHT_CACHE; FLIGHT_CACHE=$bvv
-  bv "$i" FLIGHT_SEEN_DEPART; FLIGHT_SEEN_DEPART=$bvv
   bv "$i" DONE_SYNCED; PROJECT_DONE_SYNCED=$bvv
 }
 
@@ -2186,8 +1981,6 @@ board_state_save() {
   local i="$1"
   bset "$i" PREV_INFLIGHT "$prev_inflight"
   bset "$i" FIRST "$first_cycle"
-  bset "$i" FLIGHT_CACHE "$FLIGHT_CACHE"
-  bset "$i" FLIGHT_SEEN_DEPART "$FLIGHT_SEEN_DEPART"
   bset "$i" DONE_SYNCED "$PROJECT_DONE_SYNCED"
 }
 
@@ -2229,16 +2022,9 @@ service_board_cycle() {
       # Reconcile the finished issue's board state: repo mode strips a stale
       # mgr:in-flight, project mode moves the card to Done.
       [ "$state" = "CLOSED" ] && board_finish "$g_nwo" "$g_num"
-      # Departure resets the age clock's memory: if the issue re-enters
-      # flight, the first-sight path re-reads GitHub - including, in repo
-      # mode, the timeline lookup that detects a re-claimed issue's new
-      # start. That lookup now runs exactly when it can change the answer.
-      flight_cache_drop "$gone"
-      grep -qxF "$gone" <<<"$FLIGHT_SEEN_DEPART" \
-        || FLIGHT_SEEN_DEPART=$(printf '%s\n%s' "$FLIGHT_SEEN_DEPART" "$gone")
-      # A card a human dragged out of In progress lands here too: it simply
-      # left flight, this report covers it, and the human's move stands.
-      report "issue #$g_num left flight (issue is now ${state:-unknown}). Slot freed."
+      # A card a human dragged out of In progress lands here too: the
+      # human's move stands and the passive log records the freed slot.
+      log "board $CUR_NAME: issue #$g_num left flight (issue is now ${state:-unknown}); slot freed"
     done <<<"$(comm -23 <(printf '%s\n' "$prev_inflight") <(printf '%s\n' "$inflight") 2>/dev/null)"
   fi
   prev_inflight="$inflight"
@@ -2256,83 +2042,6 @@ service_board_cycle() {
   # limit accounting below.
   sweep_orphan_worktrees
 
-  # Long-running-issue notices: once per whole hour an issue has been
-  # in-flight, never more than once for the same hour - even across watcher
-  # restarts, since the durable clock is each issue's marker comment, not a
-  # local file. FLIGHT_CACHE mirrors that record in memory (see its comment):
-  # GitHub is read once per flight period, written once per hour boundary.
-  #
-  # The scan itself runs only every AGE_SCAN_SECONDS per board (cursor in
-  # BOARD_<i>_AGE_NEXT, offset per board at startup): the notices are hourly,
-  # so scanning every poll bought nothing but first-sight reads N times
-  # sooner. Departures still drop cache rows every cycle above, so a
-  # re-claimed issue's next scan re-reads GitHub exactly as before.
-  now_epoch=$(date -u +%s)
-  bv "$CUR_IDX" AGE_NEXT
-  if [ "$now_epoch" -ge "$bvv" ]; then
-    bset "$CUR_IDX" AGE_NEXT $((now_epoch + AGE_SCAN_SECONDS))
-    while read -r key; do
-      [ -z "$key" ] && continue
-      f_nwo="${key%%#*}"
-      num="${key##*#}"
-
-      row=$(flight_cache_row "$key")
-      if [ -n "$row" ]; then
-        # Seen in flight before, and not departed since: serve from memory.
-        IFS=$'\t' read -r _ start_iso start_epoch hours_reported comment_id <<<"$row"
-        need_write=0
-      else
-        # First sight of this flight period: read the durable record back.
-        comment_id="" start_iso="" hours_reported=0
-        marker=$(age_comment_for "$f_nwo" "$num")
-        [ -n "$marker" ] && IFS=$'\t' read -r comment_id start_iso hours_reported <<<"$marker"
-
-        # The mgr:in-flight timeline is the source of truth for when the
-        # CURRENT flight period began. A marker comment surviving from an
-        # earlier period (the issue left flight and was later re-claimed)
-        # would otherwise report a bogus multi-day duration, so a labeling
-        # event newer than our recorded start resets the clock. Project mode
-        # has no labeling events to consult: there, a re-entry observed by
-        # this process resets the clock to now, and after a restart the
-        # marker's own recorded start stands.
-        latest_iso=""
-        if [ "$CUR_KIND" = "repo" ]; then
-          latest_iso=$(fetch_start_iso "$f_nwo" "$num")
-        elif grep -qxF "$key" <<<"$FLIGHT_SEEN_DEPART"; then
-          latest_iso=$(date -u +%FT%TZ)
-        fi
-        need_write=0
-        [ -z "$comment_id" ] && need_write=1
-        if [ -z "$start_iso" ] || { [ -n "$latest_iso" ] && [ "$latest_iso" \> "$start_iso" ]; }; then
-          start_iso="${latest_iso:-$(date -u +%FT%TZ)}"
-          hours_reported=0
-          need_write=1
-        fi
-        start_epoch=$(iso_to_epoch "$start_iso") || start_epoch=$now_epoch
-        [ -z "$start_epoch" ] && start_epoch=$now_epoch
-      fi
-
-      elapsed_hours=$(( (now_epoch - start_epoch) / 3600 ))
-      if [ "$elapsed_hours" -gt "$hours_reported" ]; then
-        title=$(title_for "$f_nwo" "$num")
-        log "issue #$num has been in flight for ${elapsed_hours}h: $title"
-        report "issue #$num has been in flight for ${elapsed_hours}h: $title."
-        hours_reported=$elapsed_hours
-        need_write=1
-      fi
-
-      if [ "$need_write" -eq 1 ]; then
-        if [ -n "$comment_id" ]; then
-          update_flight_comment "$f_nwo" "$comment_id" "$(flight_comment_body "$start_iso" "$hours_reported")"
-        else
-          comment_id=$(create_flight_comment "$f_nwo" "$num" "$(flight_comment_body "$start_iso" "$hours_reported")")
-        fi
-        flight_cache_put "$key" "$start_iso" "$start_epoch" "$hours_reported" "$comment_id"
-      elif [ -z "$row" ]; then
-        flight_cache_put "$key" "$start_iso" "$start_epoch" "$hours_reported" "$comment_id"
-      fi
-    done <<<"$inflight"
-  fi
 
   if ! ready_list=$(board_ready); then
     log "board $CUR_NAME: ready fetch failed: $(cat "$ERRFILE")"
@@ -2345,7 +2054,7 @@ service_board_cycle() {
   [ "$ready_n" -lt "$launch" ] && launch=$ready_n
   [ "$launch" -lt 0 ] && launch=0
 
-  log "in-flight=$count free=$free ready=$ready_n launching=$launch"
+  log "board $CUR_NAME: in-flight=$count free=$free ready=$ready_n launching=$launch"
 
   # Fetch + reconcile herdr agent list whenever there is ready work to
   # gate OR this board holds any AGENTBUSY latch that might need
@@ -2380,9 +2089,6 @@ service_board_cycle() {
     else
       log "board $CUR_NAME: herdr agent list failed or returned invalid JSON — deferring ownership reconciliation and fresh dispatch"
       launch=0
-      if skip_once "agent-list-failed-launch-gate"; then
-        report "herdr agent list failed or returned invalid JSON — live-agent gating and issue recovery are deferred until a successful snapshot."
-      fi
     fi
     if [ "$agent_list_ok" -eq 1 ] && [ -n "$agentbusy_snapshot" ]; then
       while IFS= read -r busy_key; do
@@ -2408,10 +2114,9 @@ service_board_cycle() {
       # AGENTBUSY seeded into CYCLE_SEEN at cycle-top, or another board's
       # right here in this same cycle) must not be claimed either. First
       # in-flight sighting, first claim, or first agent-busy latch this
-      # cycle wins; the loser skips quietly - a log line, not an operator
-      # report.
+      # cycle wins; the loser skips quietly with a passive log entry.
       if grep -qxF "$nwo#$num" <<<"$CYCLE_SEEN"; then
-        log "issue #$num ($nwo): already accounted for this cycle (in flight elsewhere, or a still-latched live-agent skip), skipping"
+        log "board $CUR_NAME: issue #$num ($nwo): already accounted for this cycle (in flight elsewhere, or a still-latched live-agent skip), skipping"
         continue
       fi
       # An issue whose own launch-target agent name — "$CUR_NAME-issue-$num",
@@ -2419,9 +2124,8 @@ service_board_cycle() {
       # herdr agent means a session holding that exact name has not
       # exited (normally this issue's own prior session; on a project
       # board spanning repos the same board+number can instead belong to
-      # another repo's issue #$num, since the name is not repo-qualified
-      # — the report below hedges accordingly, review #20 MN2). herdr
-      # agent names are global and unique, so claiming and launching into
+      # another repo's issue #$num, since the name is not repo-qualified.
+      # herdr agent names are global and unique, so claiming and launching into
       # a name that is still taken only fails agent start, releases the
       # claim, and re-claims it again next cycle forever (#20). Skip
       # WITHOUT claiming instead, and also fold this row into CYCLE_SEEN
@@ -2429,10 +2133,9 @@ service_board_cycle() {
       # sees the issue as un-owned (it is by definition not mgr:in-flight
       # here — its prior session already dropped that on landing) and
       # launches a second, concurrent session under its OWN board-name on
-      # the same issue and worktree. agent_busy latches the operator
-      # report to once per occurrence rather than every cycle — gated on
-      # agent_list_ok so a failed fetch (empty live_agent_names for the
-      # wrong reason) can never look like a match. The latch is cleared
+      # the same issue and worktree. agent_busy latches the diagnostic to
+      # once per occurrence — gated on agent_list_ok so a failed fetch cannot
+      # look like a match for the wrong reason. The latch is cleared
       # by the reconcile pass above this loop, not here (review #20
       # round 4 BL1): clearing in-loop was only reachable when the
       # per-issue loop got to this exact row, which the cycle-top
@@ -2443,10 +2146,9 @@ service_board_cycle() {
         CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
         if ! agent_busy "$CUR_IDX" "$nwo#$num"; then
           agent_busy_mark "$CUR_IDX" "$nwo#$num"
-          log "issue #$num: agent $agent_name is already live; skipping without claiming"
-          report "issue #$num: skipped without claiming - a live herdr agent named $agent_name already holds this launch name (herdr agent names are global and unique). This is normally a still-running session for this exact issue: no action needed, it self-heals and this issue launches automatically once that session exits and frees the name. If that session has already finished, close its tab to free the name now. On a multi-repo project board the name can instead belong to a different repo's issue #$num sharing the same board+number - free it without disturbing that other session via herdr agent rename $agent_name --clear."
+          log "board $CUR_NAME: issue #$num: live agent $agent_name retains the launch name; skipping without claiming until that session exits"
         else
-          log "issue #$num: agent $agent_name still live, already reported; skipping without claiming"
+          log "board $CUR_NAME: issue #$num: agent $agent_name still live, already noted; skipping without claiming"
         fi
         continue
       fi
@@ -2495,20 +2197,17 @@ service_board_cycle() {
             # whose owner cannot be identified.
             CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
             launched=$((launched + 1))
-            log "issue #$num: claim command failed but $CLAIM_NOUN is present; no session launched, slot reserved to avoid duplicate dispatch: $claim_diag"
-            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found the claim present, so no session was launched by this attempt and the issue was reserved for the rest of this cycle. Ownership remains unresolved; the retained claim may consume capacity until an owner finishes or the documented board ownership audit reconciles it."
+            log "board $CUR_NAME: issue #$num: claim command failed but $CLAIM_NOUN is present; no session launched, slot reserved to avoid duplicate dispatch: $claim_diag"
             ;;
           absent)
-            log "issue #$num: claim failed and read-back found $CLAIM_NOUN absent: $claim_diag"
-            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back found no claim; skipped this cycle and normal watcher recovery will retry."
+            log "board $CUR_NAME: issue #$num: claim failed and read-back found $CLAIM_NOUN absent: $claim_diag"
             ;;
           *)
             # Unknown mutation state is also fail-closed: the command may
             # have reached GitHub, so reserve both admission controls.
             CYCLE_SEEN=$(printf '%s\n%s' "$CYCLE_SEEN" "$nwo#$num")
             launched=$((launched + 1))
-            log "issue #$num: claim failed and read-back could not confirm $CLAIM_NOUN; no session launched, slot reserved to avoid duplicate dispatch: $claim_diag"
-            report "issue #$num: could not claim $CLAIM_NOUN: $claim_diag. Read-back could not confirm state; no session was launched by this attempt and the issue was reserved for the rest of this cycle. Ownership remains unresolved and the claim may consume capacity if the mutation succeeded; use the documented board ownership audit rather than replaying the mutation blindly."
+            log "board $CUR_NAME: issue #$num: claim failed and read-back could not confirm $CLAIM_NOUN; no session launched, slot reserved to avoid duplicate dispatch: $claim_diag"
             ;;
         esac
         continue
@@ -2522,8 +2221,8 @@ service_board_cycle() {
 }
 
 # Classifies the raw stderr left in $ERRFILE into a short operator-readable
-# class for the latched degraded report; the full raw error is already in
-# the watcher log from the failing cycle itself.
+# class for the latched degraded log; the full raw error is already in the
+# watcher log from the failing cycle itself.
 err_class() {
   local e
   e=$(cat "$ERRFILE" 2>/dev/null)
@@ -2554,15 +2253,15 @@ service_board() {
   service_board_cycle
   rc=$?
   board_state_save "$i"
-  # Latched degraded/recovered reports: fired on state ENTRY (the 3rd
+  # Latched degraded/recovered logs: fired on state ENTRY (the 3rd
   # consecutive failed cycle) and on state EXIT (the first success after),
-  # never repeated while the state holds. The every-cycle raw error stays
-  # log-only.
+  # never repeated while the state holds. The every-cycle raw error remains
+  # in the passive log.
   if [ "$rc" -ne 0 ]; then
     bset "$i" FAILS $((fails + 1))
-    [ $((fails + 1)) -eq 3 ] && report "degraded: $(err_class)"
+    [ $((fails + 1)) -eq 3 ] && log "board $CUR_NAME: degraded: $(err_class)"
   else
-    [ "$fails" -ge 3 ] && report "recovered"
+    [ "$fails" -ge 3 ] && log "board $CUR_NAME: recovered"
     [ "$fails" -ne 0 ] && bset "$i" FAILS 0
   fi
   return "$rc"
@@ -2571,22 +2270,18 @@ service_board() {
 b=0
 while [ "$b" -lt "$NBOARDS" ]; do
   board_ctx_load "$b"
-  log "watcher started: workspace=$CUR_WS concurrency=$CUR_CONC poll=${POLL_SECONDS}s mode=$CUR_MODE"
+  log "board $CUR_NAME: watcher started: workspace=$CUR_WS concurrency=$CUR_CONC poll=${POLL_SECONDS}s mode=$CUR_MODE"
   if [ "$CUR_KIND" = "project" ]; then
-    log "board mode: project $CUR_OWNER/$CUR_NUMBER - the Status single-select is the state machine; labels are not board state"
+    log "board $CUR_NAME: project $CUR_OWNER/$CUR_NUMBER uses the Status single-select as its state machine; labels are not board state"
   fi
   b=$((b + 1))
 done
 
-# ONE consolidated startup report listing every board — N per-board
-# messages would wake the operator session N times to say the same thing.
-report_raw "started: $NBOARDS board(s), polling every ${POLL_SECONDS}s.$BOARDS_SUMMARY
-Supervised boards stop after pushing - you instruct ready/land/done in each issue tab. Auto boards plan (tier 2, tier 3 for high-risk work), implement, run a mandatory review at the plan tier for rounds 1-2 (tier 2 if no plan ran), escalating to tier 3 from round 3, then land on their own; mgr:manual-approve still gates those merges. Launches, departures, hourly age notices and failures are reported here per board."
 
 # The operator's total load, as one visible number: concurrency summed across
 # the config, and the steady-state gh request rate (repo mode: in-flight +
 # ready fetches; project mode: item-list + one open-issue list per mapped
-# repo; launches, sweeps and the every-600s flight-age scans come on top).
+# repo; launches and sweeps come on top).
 TOTAL_CONC=0
 CALLS_PER_CYCLE=0
 b=0
